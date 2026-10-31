@@ -13,6 +13,7 @@ import base64
 import collections
 import csv
 import io
+import secrets
 import threading
 import time
 import uuid
@@ -21,9 +22,48 @@ import uuid
 DEFAULT_CAPTURE_LIMIT = 1 << 20            # 1 MiB
 DEFAULT_MAX_CLOSED_SESSIONS = 200          # 内存中最多保留的已关闭会话数
 DEFAULT_EVENT_LOG = 500                    # 事件流条数上限
+DEFAULT_API_CALL_LOG = 500                 # 外部 API 调用日志条数上限
 DEFAULT_RATE_SERIES = 120                  # 速率序列秒数上限
 
 DIRECTIONS = ("tx", "rx")
+
+TOKEN_PREFIX = "sm_"
+
+
+class Token:
+    """HTTP 接口调用令牌。全部信息仅存内存，进程退出即消失。
+
+    kind 含义：
+      - "panel"：面板内置令牌，随管理页面注入到浏览器，仅用于面板自身
+                  调用与管理类接口（/api/tokens*），不可删除/停用；
+      - "user" ：在管理页面手动创建，分发给外部 socket 流量测试工具。
+    """
+
+    def __init__(self, title: str, kind: str = "user"):
+        self.id = uuid.uuid4().hex[:12]
+        self.value = TOKEN_PREFIX + secrets.token_hex(24)
+        self.title = str(title or "").strip() or "未命名令牌"
+        self.kind = kind if kind in ("panel", "user") else "user"
+        self.enabled = True
+        self.created_at = time.time()
+        self.last_used_at = None
+        self.use_count = 0
+
+    def touch(self) -> None:
+        self.last_used_at = time.time()
+        self.use_count += 1
+
+    def summary(self) -> dict:
+        return {
+            "id": self.id,
+            "value": self.value,
+            "title": self.title,
+            "kind": self.kind,
+            "enabled": self.enabled,
+            "created_at": self.created_at,
+            "last_used_at": self.last_used_at,
+            "use_count": self.use_count,
+        }
 
 
 def _fmt_bytes(n: float) -> str:
@@ -196,6 +236,71 @@ class Store:
         self._event_seq = 0
         self.rate_series = collections.deque(maxlen=DEFAULT_RATE_SERIES)  # [(ts, tx_bps, rx_bps)]
         self.started_at = time.time()
+        self.tokens = {}                     # id -> Token
+        self.api_calls = collections.deque(maxlen=DEFAULT_API_CALL_LOG)
+        self._api_call_seq = 0
+        panel = Token("面板内置令牌", kind="panel")
+        self.tokens[panel.id] = panel
+        self.panel_token_id = panel.id
+
+    @property
+    def panel_token(self) -> Token:
+        with self.lock:
+            return self.tokens[self.panel_token_id]
+
+    # ---------------- 令牌 ----------------
+
+    def add_token(self, token: Token) -> None:
+        with self.lock:
+            self.tokens[token.id] = token
+
+    def remove_token(self, token_id: str) -> None:
+        with self.lock:
+            token = self.tokens.get(token_id)
+            if token is None:
+                raise KeyError(token_id)
+            if token.kind == "panel":
+                raise ValueError("面板内置令牌不可删除")
+            self.tokens.pop(token_id, None)
+
+    def find_token(self, value: str) -> Token | None:
+        """按令牌值查找已启用的令牌；未找到或已停用均返回 None。"""
+        if not value:
+            return None
+        with self.lock:
+            for t in self.tokens.values():
+                if secrets.compare_digest(t.value, value):
+                    return t if t.enabled else None
+        return None
+
+    def token_summaries(self) -> list:
+        with self.lock:
+            return [t.summary() for t in self.tokens.values()]
+
+    # ---------------- 外部 API 调用日志 ----------------
+
+    def record_api_call(self, token: Token | None, method: str, path: str,
+                        status: int | None, client: str,
+                        duration_ms: float) -> int:
+        """记录一次外部 /api/ 调用（面板内置令牌的调用不记录）。"""
+        with self.lock:
+            self._api_call_seq += 1
+            self.api_calls.append({
+                "seq": self._api_call_seq,
+                "ts": time.time(),
+                "token_id": token.id if token else None,
+                "token_title": token.title if token else "未认证",
+                "method": method,
+                "path": path,
+                "status": status,
+                "client": client,
+                "duration_ms": round(duration_ms, 1),
+            })
+            return self._api_call_seq
+
+    def api_calls_since(self, since: int) -> list:
+        with self.lock:
+            return [c for c in self.api_calls if c["seq"] > since]
 
     # ---------------- 事件 ----------------
 
@@ -320,6 +425,33 @@ class Store:
                 "events": list(self.events),
                 "sessions": payload,
             }
+
+    # ---------------- 重置（供外部测试建立干净基线） ----------------
+
+    def clear_sessions(self) -> int:
+        """清空全部会话与速率序列，返回被清除的会话数。
+
+        注意：进行中的连接其会话对象仍被转发线程持有，计数会继续写入
+        那些已脱离面板视图的对象，不再出现在统计中。
+        """
+        with self.lock:
+            n = len(self.sessions)
+            self.sessions.clear()
+            self.rate_series.clear()
+            return n
+
+    def clear_events(self) -> int:
+        with self.lock:
+            n = len(self.events)
+            self.events.clear()
+            return n
+
+    def take_listeners(self) -> list:
+        """摘除全部监听器（返回副本），调用方负责逐个 stop()。"""
+        with self.lock:
+            listeners = list(self.listeners.values())
+            self.listeners.clear()
+            return listeners
 
     def export_csv(self) -> str:
         with self.lock:

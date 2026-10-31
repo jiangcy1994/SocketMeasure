@@ -4,7 +4,9 @@
   - 全部接口读写均为内存数据，无任何磁盘 IO；
   - 导出接口在请求时即时生成 JSON / CSV / 原始负载，通过
     Content-Disposition 触发浏览器下载，同样不落盘；
-  - 默认仅绑定 127.0.0.1，面板无鉴权，仅供本机调试使用。
+  - 所有 /api/* 接口均需携带令牌（面板内置令牌随页面注入，用户令牌
+    在「令牌与调用」页生成）；令牌管理与调用日志仅对面板内置令牌开放；
+  - 默认仅绑定 127.0.0.1，仅供本机调试使用。
 """
 
 from __future__ import annotations
@@ -17,9 +19,11 @@ import mimetypes
 import pathlib
 import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from .model import Token
 from .proxy import create_listener
 
 log = logging.getLogger("socketmeasure.server")
@@ -27,6 +31,7 @@ log = logging.getLogger("socketmeasure.server")
 STATIC_DIR = pathlib.Path(__file__).resolve().parent / "static"
 
 INTERP_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+TOKEN_TITLE_MAX = 64
 
 
 class ApiError(Exception):
@@ -56,6 +61,7 @@ class PanelHandler(BaseHTTPRequestHandler):
 
     def _send(self, code: int, body: bytes, content_type: str,
               headers: dict | None = None):
+        self._status_code = code
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -89,6 +95,55 @@ class PanelHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args):
         log.debug("%s - %s", self.address_string(), fmt % args)
 
+    # ---------------- 鉴权 ----------------
+
+    def _token_value_from_request(self, query: dict) -> str | None:
+        """令牌来源（任选其一）：Authorization: Bearer <t>、X-API-Token、?token=。"""
+        auth = self.headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            value = auth[7:].strip()
+            if value:
+                return value
+        value = (self.headers.get("X-API-Token") or "").strip()
+        if value:
+            return value
+        value = (query.get("token") or "").strip()
+        return value or None
+
+    def _authenticate(self, rest: list, query: dict) -> Token | None:
+        """校验 /api/* 请求的令牌。成功返回 Token，失败抛 401 ApiError。"""
+        value = self._token_value_from_request(query)
+        token = self.store.find_token(value)
+        is_token_admin = bool(rest) and rest[0] == "tokens"
+        if is_token_admin:
+            # 令牌管理（创建/列出/停用/删除）仅限面板内置令牌
+            if token is None or token.kind != "panel":
+                raise ApiError("令牌管理接口仅限面板内置令牌调用", 401)
+            token.touch()
+            return token
+        if token is None:
+            if value:
+                raise ApiError("token 无效或已停用", 401)
+            raise ApiError(
+                "缺少 token：请使用 Authorization: Bearer <token>、"
+                "X-API-Token 头或 ?token= 查询参数（令牌在面板「令牌与调用」页生成）",
+                401)
+        token.touch()
+        return token
+
+    def _record_call(self, method: str, path: str, token: Token | None,
+                     started: float) -> None:
+        """记录外部调用；面板内置令牌与静态资源不记录。"""
+        if token is not None and token.kind == "panel":
+            return
+        try:
+            self.store.record_api_call(
+                token, method, path, self._status_code,
+                self.address_string(),
+                (time.monotonic() - started) * 1000.0)
+        except Exception:
+            log.exception("记录 API 调用日志失败")
+
     # ---------------- 路由 ----------------
 
     def do_GET(self):
@@ -101,6 +156,11 @@ class PanelHandler(BaseHTTPRequestHandler):
         self._dispatch("DELETE")
 
     def _dispatch(self, method: str) -> None:
+        self._status_code = None
+        self._api_path = None
+        self._auth_token = None
+        token = None
+        started = time.monotonic()
         try:
             parsed = urlparse(self.path)
             segments = [s for s in parsed.path.split("/") if s]
@@ -116,48 +176,145 @@ class PanelHandler(BaseHTTPRequestHandler):
             if not rest:
                 raise ApiError("未知接口", 404)
 
-            key = (method, rest[0])
-            if key == ("GET", "state"):
-                return self._ok(self.store.state(self.registry))
-            if key == ("GET", "events"):
-                since = int(query.get("since", "0"))
-                return self._ok({"events": self.store.events_since(since)})
-            # 带路径参数的路由优先于列表路由
-            if rest[0] == "sessions" and len(rest) >= 2:
-                return self._route_session(method, rest[1:], rest[1], query)
-            if rest[0] == "listeners" and len(rest) >= 2:
-                return self._route_listener(method, rest[1:], rest[1])
-            if rest[0] == "interpreters" and len(rest) >= 2:
-                return self._route_interpreter(method, rest[1:], rest[1])
-
-            if key == ("GET", "sessions"):
-                return self._ok({"sessions": [s.summary() for s in
-                                              reversed(list(self.store.sessions.values()))]})
-            if key == ("GET", "listeners"):
-                return self._ok({"listeners": [l.summary()
-                                               for l in self.store.listeners.values()]})
-            if key == ("GET", "interpreters"):
-                return self._ok({"interpreters": self.registry.info()})
-
-            # /api/sessions/{id}... /api/listeners/{id} /api/interpreters/{id}...
-            # 见上方带参数路由
-
-            if key == ("POST", "listeners"):
-                return self._create_listener()
-            if key == ("POST", "interpreters"):
-                return self._register_interpreter()
-            if key == ("POST", "interpreters-test"):
-                return self._test_interpreter()
-            if key == ("GET", "export"):
-                return self._export(query)
-            raise ApiError(f"未知接口: {method} /api/{'/'.join(rest)}", 404)
+            self._api_path = parsed.path
+            try:
+                token = self._authenticate(rest, query)
+            except ApiError as e:
+                self._err(e.code, str(e))
+                return
+            self._auth_token = token
+            self._route_api(method, rest, query)
         except ApiError as e:
-            return self._err(e.code, str(e))
+            self._err(e.code, str(e))
         except BrokenPipeError:
             return
         except Exception:
             log.exception("处理请求 %s %s 时发生错误", method, self.path)
             return self._err(500, "服务器内部错误，已记录日志")
+        finally:
+            if self._api_path is not None:
+                self._record_call(method, self._api_path, token, started)
+
+    def _route_api(self, method: str, rest: list, query: dict) -> None:
+        key = (method, rest[0])
+        if key == ("GET", "state"):
+            return self._ok(self.store.state(self.registry))
+        if key == ("GET", "events"):
+            since = int(query.get("since", "0"))
+            return self._ok({"events": self.store.events_since(since)})
+        if key == ("GET", "health"):
+            t = self._auth_token
+            return self._ok({
+                "ok": True,
+                "service": "socketmeasure",
+                "version": "0.1.0",
+                "token_title": t.title if t else None,
+                "now": time.time(),
+            })
+        if key == ("GET", "apicalls"):
+            since = int(query.get("since", "0"))
+            calls = self.store.api_calls_since(since)
+            return self._ok({
+                "calls": calls,
+                "seq": calls[-1]["seq"] if calls else since,
+            })
+        if key == ("POST", "reset"):
+            return self._reset()
+        # 带路径参数的路由优先于列表路由
+        if rest[0] == "sessions" and len(rest) >= 2:
+            return self._route_session(method, rest[1:], rest[1], query)
+        if rest[0] == "listeners" and len(rest) >= 2:
+            return self._route_listener(method, rest[1:], rest[1])
+        if rest[0] == "interpreters" and len(rest) >= 2:
+            return self._route_interpreter(method, rest[1:], rest[1])
+        if rest[0] == "tokens" and len(rest) >= 2:
+            return self._route_token(method, rest[1:], rest[1])
+
+        if key == ("GET", "sessions"):
+            return self._ok({"sessions": [s.summary() for s in
+                                          reversed(list(self.store.sessions.values()))]})
+        if key == ("GET", "listeners"):
+            return self._ok({"listeners": [l.summary()
+                                           for l in self.store.listeners.values()]})
+        if key == ("GET", "interpreters"):
+            return self._ok({"interpreters": self.registry.info()})
+
+        # /api/sessions/{id}... /api/listeners/{id} /api/interpreters/{id}...
+        # /api/tokens/{id}... 见上方带参数路由
+
+        if key == ("POST", "listeners"):
+            return self._create_listener()
+        if key == ("POST", "interpreters"):
+            return self._register_interpreter()
+        if key == ("POST", "interpreters-test"):
+            return self._test_interpreter()
+        if key == ("POST", "tokens"):
+            return self._create_token()
+        if key == ("GET", "tokens"):
+            return self._ok({"tokens": self.store.token_summaries()})
+        if key == ("GET", "export"):
+            return self._export(query)
+        raise ApiError(f"未知接口: {method} /api/{'/'.join(rest)}", 404)
+
+    # ---------------- 令牌 ----------------
+
+    def _create_token(self):
+        body = self._read_json_body()
+        title = str(body.get("title") or "").strip()
+        if not title:
+            raise ApiError("title 不能为空")
+        if len(title) > TOKEN_TITLE_MAX:
+            raise ApiError(f"title 长度不能超过 {TOKEN_TITLE_MAX} 个字符")
+        token = Token(title, kind="user")
+        self.store.add_token(token)
+        self.store.event("token", f"创建令牌 {title}（{token.id}）")
+        return self._ok({"token": token.summary()})
+
+    def _route_token(self, method: str, rest: list, token_id: str):
+        token = self.store.tokens.get(token_id)
+        if token is None:
+            raise ApiError(f"令牌 {token_id} 不存在", 404)
+        if len(rest) >= 2 and rest[1] == "toggle" and method == "POST":
+            if token.kind == "panel":
+                raise ApiError("面板内置令牌不可停用", 400)
+            body = self._read_json_body()
+            token.enabled = bool(body.get("enabled", True))
+            self.store.event("token",
+                             f"{'启用' if token.enabled else '停用'}令牌 {token.title}")
+            return self._ok({"token": token.summary()})
+        if method == "DELETE":
+            if token.kind == "panel":
+                raise ApiError("面板内置令牌不可删除", 400)
+            try:
+                self.store.remove_token(token_id)
+            except KeyError:
+                raise ApiError(f"令牌 {token_id} 不存在", 404)
+            self.store.event("token", f"删除令牌 {token.title}")
+            return self._ok({"removed": token_id})
+        raise ApiError("不支持的令牌操作", 405)
+
+    # ---------------- 重置（外部测试建立基线） ----------------
+
+    def _reset(self):
+        body = self._read_json_body()
+        do_sessions = body.get("sessions", True)
+        do_listeners = bool(body.get("listeners", False))
+        do_events = bool(body.get("events", False))
+        result = {}
+        if do_listeners:
+            listeners = self.store.take_listeners()
+            for l in listeners:
+                l.stop()
+            result["listeners_removed"] = len(listeners)
+            self.store.event("listener", "reset 清空全部监听器")
+        if do_sessions:
+            result["sessions_removed"] = self.store.clear_sessions()
+        if do_events:
+            result["events_removed"] = self.store.clear_events()
+        if not result:
+            result["note"] = "未指定任何清理项（sessions/listeners/events 均为 false）"
+        self.store.event("system", "通过 API 重置测量数据基线", result)
+        return self._ok({"reset": result})
 
     # ---------------- 监听器 ----------------
 
@@ -353,7 +510,16 @@ class PanelHandler(BaseHTTPRequestHandler):
                 path = STATIC_DIR / "index.html"
                 if not path.is_file():
                     raise ApiError("面板页面缺失：static/index.html 不存在", 500)
-                PanelHandler._index_cache = path.read_text(encoding="utf-8").encode("utf-8")
+                html = path.read_text(encoding="utf-8")
+                # 注入面板内置令牌：面板自身调用全部 /api/* 时携带
+                token_value = self.store.panel_token.value
+                inject = (f'<script>window.SM_PANEL_TOKEN='
+                          f'{json.dumps(token_value)};</script>')
+                if "</head>" in html:
+                    html = html.replace("</head>", inject + "</head>", 1)
+                else:
+                    html = inject + html
+                PanelHandler._index_cache = html.encode("utf-8")
         self._send(200, PanelHandler._index_cache, "text/html; charset=utf-8")
 
     def _serve_static(self, segments: list):

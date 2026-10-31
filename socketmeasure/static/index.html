@@ -193,6 +193,27 @@
   .switch input:checked + .slide::after { left: 18px; background: var(--series-1); }
   .code-editor { display: grid; grid-template-columns: 1fr; gap: 10px; }
   .code-editor .fields { display: flex; gap: 10px; flex-wrap: wrap; }
+  /* ---- 令牌与调用日志 ---- */
+  .token-value {
+    font: 12px var(--mono); color: var(--ink-2);
+    background: var(--page); border: 1px solid var(--grid); border-radius: 6px;
+    padding: 2px 8px; user-select: all; max-width: 340px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; display: inline-block;
+    vertical-align: middle;
+  }
+  ul.api-calls { list-style: none; margin: 0; padding: 0; max-height: 360px; overflow: auto; }
+  ul.api-calls li {
+    display: grid; grid-template-columns: 62px 108px 56px 1fr 48px 76px;
+    gap: 8px; padding: 5px 2px; border-bottom: 1px solid var(--grid);
+    font-size: 12.5px; font-variant-numeric: tabular-nums; align-items: baseline;
+  }
+  ul.api-calls li.head { color: var(--ink-3); font-size: 11.5px; border-bottom-color: var(--axis); }
+  ul.api-calls .m { font: 11.5px var(--mono); color: var(--ink-3); }
+  ul.api-calls .path { font: 12px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  ul.api-calls .st-2xx { color: var(--good); } ul.api-calls .st-4xx { color: var(--warning); }
+  ul.api-calls .st-5xx, ul.api-calls .st-na { color: var(--critical); }
+  ul.api-calls .who-na { color: var(--critical); }
+
   .two-col { display: grid; grid-template-columns: 1.1fr .9fr; gap: 16px; }
   @media (max-width: 960px) { .two-col { grid-template-columns: 1fr; } }
   footer { color: var(--ink-3); font-size: 12px; padding: 20px 24px; }
@@ -217,6 +238,7 @@
   <button data-tab="dashboard" class="active">仪表盘</button>
   <button data-tab="sessions">会话</button>
   <button data-tab="interpreters">解读器</button>
+  <button data-tab="tokens">令牌与调用</button>
   <button data-tab="export">导出 / 关于</button>
 </nav>
 
@@ -308,6 +330,34 @@
     </div>
   </section>
 
+  <!-- ================= 令牌与调用 ================= -->
+  <section id="tab-tokens" class="hidden">
+    <div class="panel">
+      <h2>HTTP 接口令牌 <span class="hint">（供外部 socket 流量测试工具调用 /api/* 时使用，仅存内存）</span></h2>
+      <table>
+        <thead><tr>
+          <th>标题</th><th>令牌</th><th>类型</th><th>状态</th>
+          <th class="num">使用次数</th><th>最近使用</th><th>创建时间</th><th></th>
+        </tr></thead>
+        <tbody id="tokenBody"></tbody>
+      </table>
+      <form id="addTokenForm" class="form-row" style="margin-top:12px">
+        <label>标题 <input name="title" placeholder="如 压测脚本" size="16" required maxlength="64"></label>
+        <button class="primary" type="submit">＋ 生成令牌</button>
+        <span class="hint">令牌只在创建时完整显示一次，请立即复制保存；也可在列表中随时复制。</span>
+      </form>
+      <p class="hint" style="margin:10px 0 0">
+        调用方式：<code>Authorization: Bearer &lt;令牌&gt;</code> 或 <code>X-API-Token: &lt;令牌&gt;</code> 头，
+        或 <code>?token=&lt;令牌&gt;</code> 查询参数，三选一。完整接口文档见
+        <code>docs/API.md</code>。
+      </p>
+    </div>
+    <div class="panel">
+      <h2>外部调用记录 <span class="hint">（面板自身的调用不记录；最多保留最近 500 条）</span></h2>
+      <ul class="api-calls" id="apiCallList"></ul>
+    </div>
+  </section>
+
   <!-- ================= 导出 ================= -->
   <section id="tab-export" class="hidden">
     <div class="panel">
@@ -359,6 +409,37 @@ function fmtTime(ts) {
 function fmtDur(s) {
   if (s == null) return "—";
   return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+}
+
+/* ================= 接口令牌 ================= */
+/* 面板内置令牌由服务端注入本页面；面板自身调用 /api/* 时统一携带。
+   外部测试工具需在「令牌与调用」页单独生成令牌。 */
+const TOKEN = window.SM_PANEL_TOKEN || "";
+
+function api(path, opts = {}) {
+  const headers = Object.assign({}, opts.headers || {});
+  if (TOKEN) headers["X-API-Token"] = TOKEN;
+  return fetch(path, Object.assign({}, opts, { headers }));
+}
+
+/* 供浏览器下载类 GET 接口（export / payload）拼接令牌查询参数 */
+function withToken(url) {
+  if (!TOKEN) return url;
+  return url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN);
+}
+
+function copyToClipboard(text) {
+  const done = () => showToast("已复制", text.slice(0, 24) + (text.length > 24 ? "…" : ""));
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
+  } else fallbackCopy(text, done);
+}
+function fallbackCopy(text, done) {
+  const ta = document.createElement("textarea");
+  ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); done(); } catch (e) { showToast("复制失败", "请手动选择文本复制", "error"); }
+  ta.remove();
 }
 
 /* ================= 全局状态 ================= */
@@ -419,6 +500,7 @@ $$("nav.tabs button").forEach(btn => btn.addEventListener("click", () => {
   $$("main > section").forEach(s => s.classList.toggle("hidden", s.id !== `tab-${App.tab}`));
   if (App.tab === "sessions" && App.selectedSessionId) loadSessionDetail(App.selectedSessionId);
   if (App.tab === "interpreters") renderInterpreters();
+  if (App.tab === "tokens") { pollTokens(); pollApiCalls(); }
 }));
 
 /* ================= 仪表盘 ================= */
@@ -456,7 +538,7 @@ function renderListeners(st) {
   $$("[data-remove-listener]", body).forEach(b =>
     b.addEventListener("click", () => {
       if (!confirm("删除该监听器？进行中的会话将断开。")) return;
-      fetch(`/api/listeners/${b.dataset.removeListener}`, { method: "DELETE" })
+      api(`/api/listeners/${b.dataset.removeListener}`, { method: "DELETE" })
         .then(r => r.json()).then(poll).catch(() => poll());
     }));
 }
@@ -470,7 +552,7 @@ $("#addListenerForm").addEventListener("submit", e => {
     target_host: fd.get("target_host") || "127.0.0.1",
     target_port: fd.get("target_port") ? Number(fd.get("target_port")) : Number(fd.get("listen_port")),
   };
-  fetch("/api/listeners", {
+  api("/api/listeners", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   }).then(r => r.json()).then(j => {
@@ -481,7 +563,7 @@ $("#addListenerForm").addEventListener("submit", e => {
 
 /* ================= 事件流 ================= */
 function pollEvents() {
-  fetch(`/api/events?since=${App.eventSeq}`).then(r => r.json()).then(data => {
+  api(`/api/events?since=${App.eventSeq}`).then(r => r.json()).then(data => {
     const list = data.events || [];
     if (!list.length) return;
     App.eventSeq = list[list.length - 1].seq;
@@ -899,13 +981,14 @@ function renderSessionDetail(det) {
   $("#reInterpretBtn").addEventListener("click", () => loadSessionDetail(sm.id, true));
   $("[data-download-payload]").addEventListener("click", e => {
     const b = e.currentTarget;
-    window.location.href = `/api/sessions/${b.dataset.sessionId}/payload?direction=${b.dataset.downloadPayload}&encoding=bin`;
+    window.location.href = withToken(
+      `/api/sessions/${b.dataset.sessionId}/payload?direction=${b.dataset.downloadPayload}&encoding=bin`);
   });
 }
 
 function loadSessionDetail(id, force) {
   const url = `/api/sessions/${id}` + (force ? "/interpret" : "");
-  fetch(url).then(r => r.json()).then(data => {
+  api(url).then(r => r.json()).then(data => {
     if (data.error) { alert(data.error); return; }
     renderSessionDetail(data.session);
   }).catch(() => {});
@@ -926,18 +1009,18 @@ function renderInterpreters() {
         <button class="danger" data-del-interp="${i.id}">删除</button>` : ""}
     </div>`).join("");
   $$("[data-toggle-interp]", list).forEach(cb => cb.addEventListener("change", () => {
-    fetch(`/api/interpreters/${cb.dataset.toggleInterp}/toggle`, {
+    api(`/api/interpreters/${cb.dataset.toggleInterp}/toggle`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled: cb.checked }),
     }).then(r => r.json()).then(poll).catch(() => poll());
   }));
   $$("[data-del-interp]", list).forEach(b => b.addEventListener("click", () => {
     if (!confirm(`删除自定义解读器 ${b.dataset.delInterp}？`)) return;
-    fetch(`/api/interpreters/${b.dataset.delInterp}`, { method: "DELETE" })
+    api(`/api/interpreters/${b.dataset.delInterp}`, { method: "DELETE" })
       .then(r => r.json()).then(poll).catch(() => poll());
   }));
   $$("[data-view-code]", list).forEach(a => a.addEventListener("click", () => {
-    fetch(`/api/interpreters/${a.dataset.viewCode}/code`).then(r => r.json()).then(data => {
+    api(`/api/interpreters/${a.dataset.viewCode}/code`).then(r => r.json()).then(data => {
       $("#newInterpId").value = data.id;
       $("#newInterpTitle").value = data.title;
       $("#newInterpCode").value = data.code;
@@ -961,7 +1044,7 @@ $("#registerInterpBtn").addEventListener("click", () => {
     enabled: $("#newInterpEnabled").checked,
   };
   if (!body.id) { alert("请填写解读器 ID"); return; }
-  fetch("/api/interpreters", {
+  api("/api/interpreters", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   }).then(r => r.json()).then(j => {
@@ -975,7 +1058,7 @@ $("#testInterpBtn").addEventListener("click", () => {
   const sel = App.state && App.state.sessions ? App.state.sessions[0] : null;
   const body = { code: $("#newInterpCode").value, direction: App.detailDir || "tx" };
   if (sel) body.session_id = sel.id;
-  fetch("/api/interpreters-test", {
+  api("/api/interpreters-test", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   }).then(r => r.json()).then(j => {
@@ -986,12 +1069,104 @@ $("#testInterpBtn").addEventListener("click", () => {
 
 /* ================= 导出 ================= */
 $$("[data-download]").forEach(b => b.addEventListener("click", () => {
-  window.location.href = b.dataset.download;
+  window.location.href = withToken(b.dataset.download);
 }));
+
+/* ================= 令牌与调用日志 ================= */
+const AppCallSeq = { seq: 0 };
+
+function renderTokens(tokens) {
+  const body = $("#tokenBody");
+  if (!tokens.length) {
+    body.innerHTML = `<tr><td colspan="8" style="color:var(--ink-3)">暂无令牌，使用下方表单生成。</td></tr>`;
+    return;
+  }
+  body.innerHTML = tokens.map(t => `
+    <tr>
+      <td>${esc(t.title)}</td>
+      <td><span class="token-value" title="点击行内任意位置可选中">${esc(t.value)}</span>
+          <button class="muted-link" data-copy-token="${esc(t.value)}">复制</button></td>
+      <td><span class="pill badge">${t.kind === "panel" ? "面板内置" : "外部"}</span></td>
+      <td>${t.kind === "panel"
+        ? '<span class="pill open">启用</span>'
+        : `<label class="switch"><input type="checkbox" data-toggle-token="${t.id}" ${t.enabled ? "checked" : ""}>
+             <span class="slide"></span></label>`}</td>
+      <td class="num">${t.use_count}</td>
+      <td>${fmtTime(t.last_used_at)}</td>
+      <td>${fmtTime(t.created_at)}</td>
+      <td>${t.kind === "panel" ? "" : `<button class="danger" data-del-token="${t.id}">删除</button>`}</td>
+    </tr>`).join("");
+  $$("[data-copy-token]", body).forEach(b => b.addEventListener("click", () => copyToClipboard(b.dataset.copyToken)));
+  $$("[data-toggle-token]", body).forEach(cb => cb.addEventListener("change", () => {
+    api(`/api/tokens/${cb.dataset.toggleToken}/toggle`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: cb.checked }),
+    }).then(r => r.json()).then(pollTokens).catch(() => pollTokens());
+  }));
+  $$("[data-del-token]", body).forEach(b => b.addEventListener("click", () => {
+    if (!confirm("删除该令牌？使用它的外部工具将立即失去调用权限。")) return;
+    api(`/api/tokens/${b.dataset.delToken}`, { method: "DELETE" })
+      .then(r => r.json()).then(pollTokens).catch(() => pollTokens());
+  }));
+}
+
+$("#addTokenForm").addEventListener("submit", e => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  api("/api/tokens", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: fd.get("title") }),
+  }).then(r => r.json()).then(j => {
+    if (j.error) { alert("生成失败：" + j.error); return; }
+    e.target.reset();
+    pollTokens();
+    copyToClipboard(j.token.value);
+    showToast("令牌已生成并复制", j.token.title + " —— 请妥善保存，仅存内存，重启后消失");
+  }).catch(() => alert("生成失败：网络错误"));
+});
+
+function pollTokens() {
+  api("/api/tokens").then(r => r.json()).then(data => {
+    if (data.error) return;
+    renderTokens(data.tokens || []);
+  }).catch(() => {});
+}
+
+function renderApiCalls(calls) {
+  const el = $("#apiCallList");
+  const rows = calls.map(c => {
+    const st = c.status == null ? "na" : String(c.status)[0] + "xx";
+    const who = c.token_title === "未认证" ? "who-na" : "";
+    return `<li>
+      <span class="t">${fmtTime(c.ts)}</span>
+      <span class="${who}">${esc(c.token_title || "未认证")}</span>
+      <span class="m">${esc(c.method)}</span>
+      <span class="path" title="${esc(c.path)}">${esc(c.path)}</span>
+      <span class="st-${st}">${c.status == null ? "—" : c.status}</span>
+      <span class="m">${esc(c.client)} · ${c.duration_ms}ms</span>
+    </li>`;
+  });
+  el.innerHTML = `<li class="head">
+      <span>时间</span><span>令牌</span><span>方法</span><span>路径</span><span>状态</span><span>来源</span>
+    </li>` + (rows.length ? rows.join("")
+      : `<li style="display:block;color:var(--ink-3);padding:10px 2px">暂无外部调用记录。</li>`);
+  el.scrollTop = el.scrollHeight;
+}
+
+function pollApiCalls() {
+  api(`/api/apicalls?since=${AppCallSeq.seq}`).then(r => r.json()).then(data => {
+    if (data.error) return;
+    const calls = data.calls || [];
+    if (calls.length) {
+      AppCallSeq.seq = calls[calls.length - 1].seq;
+      renderApiCalls(calls);
+    }
+  }).catch(() => {});
+}
 
 /* ================= 轮询主循环 ================= */
 function poll() {
-  fetch("/api/state").then(r => r.json()).then(st => {
+  api("/api/state").then(r => r.json()).then(st => {
     App.state = st;
     renderTiles(st);
     renderListeners(st);
@@ -1001,6 +1176,7 @@ function poll() {
     if (App.tab === "dashboard") renderSessions(st);
     if (App.tab === "sessions") renderSessions(st);
     if (App.tab === "interpreters") renderInterpreters();
+    if (App.tab === "tokens") { pollTokens(); pollApiCalls(); }
   }).catch(() => {});
 }
 

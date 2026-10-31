@@ -46,6 +46,7 @@ uv run python -m socketmeasure --port 8099 --forward echo:18080:127.0.0.1:18081
 | 保留的已关闭会话数 | 200 |
 | 事件流条数 | 500 |
 | 速率序列 | 120 秒 |
+| 外部 API 调用日志 | 500 |
 
 导出（JSON / CSV / 原始负载）在请求时即时生成，通过 `Content-Disposition`
 触发浏览器下载，不生成临时文件。
@@ -105,10 +106,16 @@ def interpret(payload: bytes, meta: dict) -> str | dict:
 
 ## HTTP API
 
+**所有 `/api/*` 接口均需令牌鉴权**（令牌在面板「令牌与调用」页生成），支持
+`Authorization: Bearer <token>`、`X-API-Token` 头或 `?token=` 查询参数三种方式。
+完整的调用说明、字段定义与 curl/Python 示例见 [docs/API.md](docs/API.md)。
+
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
+| GET | `/api/health` | 健康检查，返回令牌名称（验证令牌最便宜的方式） |
 | GET | `/api/state` | 面板全量状态（汇总、监听器、会话、解读器、速率序列） |
 | GET | `/api/events?since=N` | 事件流 |
+| GET | `/api/apicalls?since=N` | 外部调用日志 |
 | GET | `/api/sessions` | 会话列表 |
 | GET | `/api/sessions/{id}` | 会话详情（含 base64 负载与解读结果） |
 | POST | `/api/sessions/{id}/interpret` | 清除解读缓存并重新解读 |
@@ -123,6 +130,18 @@ def interpret(payload: bytes, meta: dict) -> str | dict:
 | DELETE | `/api/interpreters/{id}` | 删除自定义解读器（内置不可删） |
 | POST | `/api/interpreters-test` | 试运行解读器（`code` + `payload_b64` 或 `session_id`） |
 | GET | `/api/export?format=json\|csv&scope=sessions` | 导出 |
+| POST | `/api/reset` | 重置基线（`sessions`/`listeners`/`events`） |
+| GET/POST | `/api/tokens` | 令牌列表/创建（仅面板内置令牌可调用） |
+| POST/DELETE | `/api/tokens/{id}` | 启用/停用/删除令牌（仅面板内置令牌可调用） |
+
+## 令牌与调用
+
+- **生成令牌**：面板「令牌与调用」页填写名称 → 「＋ 生成令牌」，复制
+  `sm_` 开头的令牌值分发给外部工具。面板内置令牌随页面注入浏览器，
+  不可删除/停用，且只有它能管理令牌。
+- **调用日志**：外部工具的每次 `/api/*` 调用（含鉴权失败的匿名调用）都会
+  记录在面板「令牌与调用」页，含时间、令牌、方法、路径、状态码、耗时，
+  内存中保留最近 500 条；面板自身的调用不记录。
 
 ## 端到端测试
 
@@ -135,8 +154,9 @@ uv run python tests/e2e_test.py
 
 ## 安全说明
 
-- 面板**无鉴权**，默认只绑定 `127.0.0.1`，仅供本机调试；不要用 `--host 0.0.0.0`
-  暴露到不可信网络。
+- 面板 HTTP 接口需令牌鉴权（令牌只存内存，进程退出即失效）；面板仍默认
+  只绑定 `127.0.0.1`，仅供本机调试；不要用 `--host 0.0.0.0` 暴露到不可信网络。
+- 令牌相当于完全的 API 访问权限，请勿嵌入公开仓库或日志。
 - 自定义解读器的代码以当前进程权限执行，只用于自己编写的调试脚本。
 - 转发监听器监听的端口不要暴露给不可信来源。
 
@@ -146,11 +166,12 @@ uv run python tests/e2e_test.py
 socketmeasure/
   app.py           命令行入口、后台监控线程
   proxy.py         TCP 转发监听器（计量引擎）
-  model.py         会话 / 存储 / 事件 / 导出（内存模型）
+  model.py         会话 / 存储 / 令牌 / 事件 / 导出（内存模型）
   interpreters.py  解读器注册表与内置解读器
   server.py        Web 面板（REST API + 单页面）
   static/index.html  单文件控制台 UI
   __main__.py      python -m 入口
+docs/API.md             HTTP API 调用文档（含 curl/Python 示例）
 tests/e2e_test.py        端到端测试（Python）
 tests/parse_modes_test.js  负载解析模式单元测试（node 运行，无需浏览器）
 ```
