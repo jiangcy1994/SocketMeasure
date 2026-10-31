@@ -1,0 +1,1014 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SocketMeasure · Socket 端口收发测量面板</title>
+<style>
+  :root, [data-theme="dark"] {
+    --page:        #0d0d0d;
+    --surface-1:   #1a1a19;
+    --surface-2:   #232322;
+    --ink-1:       #f0efec;
+    --ink-2:       #c3c2b7;
+    --ink-3:       #898781;
+    --grid:        #2c2c2a;
+    --axis:        #383835;
+    --series-1:    #3987e5;   /* 上行 tx —— categorical slot 1（蓝） */
+    --series-2:    #d95926;   /* 下行 rx —— categorical slot 2（橙） */
+    --good:        #0ca30c;
+    --warning:     #fab219;
+    --critical:    #d03b3b;
+    --ring:        rgba(255,255,255,0.10);
+    --system: system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: ui-monospace, "SF Mono", Consolas, "Courier New", monospace;
+  }
+  [data-theme="light"] {
+    --page:        #f4f3f0;
+    --surface-1:   #ffffff;
+    --surface-2:   #eceae4;
+    --ink-1:       #1d1d1a;
+    --ink-2:       #4e4d48;
+    --ink-3:       #78766f;
+    --grid:        #dddad2;
+    --axis:        #c7c4ba;
+    --series-1:    #1f6fd0;   /* 暗化以保证浅底对比度（categorical slot 1） */
+    --series-2:    #c04a1a;   /* categorical slot 2 */
+    --good:        #0a7a0a;
+    --warning:     #9a6b00;
+    --critical:    #b02a2a;
+    --ring:        rgba(0,0,0,0.14);
+    --system: system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: ui-monospace, "SF Mono", Consolas, "Courier New", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink-1);
+    font: 14px/1.5 var(--system); padding-bottom: 60px;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 18px 24px 12px; border-bottom: 1px solid var(--axis);
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  header .sub { color: var(--ink-3); font-size: 12.5px; }
+  header .since { color: var(--ink-3); font-size: 12px; margin-left: auto; font-variant-numeric: tabular-nums; }
+  header .theme-switch { display: flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: 12.5px; }
+  header .theme-switch select { padding: 4px 8px; font-size: 12.5px; }
+  nav.tabs { display: flex; gap: 4px; padding: 10px 24px 0; }
+  nav.tabs button {
+    appearance: none; border: 1px solid transparent; border-bottom: none;
+    background: transparent; color: var(--ink-2); font: inherit;
+    padding: 7px 16px; border-radius: 8px 8px 0 0; cursor: pointer;
+  }
+  nav.tabs button:hover { color: var(--ink-1); background: var(--surface-2); }
+  nav.tabs button.active { background: var(--surface-1); color: var(--ink-1); border-color: var(--axis); }
+  main { padding: 16px 24px 0; }
+  .panel {
+    background: var(--surface-1); border: 1px solid var(--axis);
+    border-radius: 10px; padding: 16px; margin-bottom: 16px;
+  }
+  .panel > h2 { font-size: 13px; margin: 0 0 12px; color: var(--ink-2); font-weight: 600;
+    text-transform: uppercase; letter-spacing: .08em; }
+  .hidden { display: none !important; }
+
+  /* ---- 仪表盘 ---- */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .tile {
+    background: var(--surface-1); border: 1px solid var(--axis); border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .tile .label { color: var(--ink-3); font-size: 12px; }
+  .tile .value { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .tile .value small { font-size: 12px; color: var(--ink-3); font-weight: 400; }
+  .tile.tx .value { color: var(--series-1); } .tile.rx .value { color: var(--series-2); }
+  .chart-wrap { position: relative; }
+  canvas#rateChart { width: 100%; height: 220px; display: block; }
+  .chart-legend { display: flex; gap: 18px; padding: 6px 2px 0; color: var(--ink-2); font-size: 12.5px; }
+  .chart-legend .sw { display: inline-block; width: 14px; height: 3px; border-radius: 2px;
+    vertical-align: middle; margin-right: 6px; }
+  .tooltip {
+    position: absolute; pointer-events: none; background: var(--surface-2);
+    border: 1px solid var(--ring); border-radius: 8px; padding: 8px 10px;
+    font-size: 12px; font-variant-numeric: tabular-nums; display: none; z-index: 5;
+    box-shadow: 0 6px 18px rgba(0,0,0,.45); white-space: nowrap;
+  }
+  .tooltip .tt { color: var(--ink-3); margin-bottom: 4px; }
+  .tooltip .row { display: flex; gap: 8px; align-items: center; }
+  .tooltip .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+
+  /* ---- 表格 ---- */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--grid); }
+  th { color: var(--ink-3); font-weight: 500; font-size: 12px; white-space: nowrap; }
+  tbody tr:hover { background: var(--surface-2); }
+  tbody tr.session-row { cursor: pointer; }
+  tbody tr.session-row.selected { background: var(--surface-2); }
+  td.num, th.num { text-align: right; }
+  .pill { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 11.5px; border: 1px solid var(--ring); }
+  .pill.open { color: var(--good); border-color: rgba(12,163,12,.4); }
+  .pill.closed { color: var(--ink-3); }
+  .pill.failed { color: var(--critical); border-color: rgba(208,59,59,.45); }
+  .pill.badge { color: var(--ink-2); }
+
+  /* ---- 表单 / 按钮 ---- */
+  button, input, select, textarea {
+    font: inherit; color: var(--ink-1); background: var(--surface-2);
+    border: 1px solid var(--ring); border-radius: 8px; padding: 7px 12px;
+  }
+  button { cursor: pointer; }
+  button.primary { background: var(--series-1); border-color: transparent; color: #fff; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.1); }
+  button.danger { color: var(--critical); border-color: rgba(208,59,59,.45); }
+  button:hover { border-color: rgba(255,255,255,.2); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  input[type=number] { width: 92px; }
+  textarea { width: 100%; min-height: 130px; font: 12.5px/1.5 var(--mono); resize: vertical; }
+  .form-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .form-row label { color: var(--ink-3); font-size: 12.5px; }
+  .hint { color: var(--ink-3); font-size: 12px; }
+
+  /* ---- 事件流 ---- */
+  ul.events { list-style: none; margin: 0; padding: 0; max-height: 300px; overflow: auto; }
+  ul.events li { padding: 5px 0 5px 14px; border-left: 2px solid var(--axis); margin-left: 6px;
+    color: var(--ink-2); font-size: 12.5px; }
+  ul.events li b { color: var(--ink-1); font-weight: 600; }
+  ul.events li.error { border-left-color: var(--critical); }
+  ul.events li .t { color: var(--ink-3); font-variant-numeric: tabular-nums; margin-right: 8px; }
+
+  /* ---- 会话详情 ---- */
+  .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .detail-grid .cell { background: var(--surface-2); border-radius: 8px; padding: 8px 12px; }
+  .detail-grid .cell .k { color: var(--ink-3); font-size: 11.5px; }
+  .detail-grid .cell .v { font-variant-numeric: tabular-nums; }
+  .dir-toggle { display: inline-flex; border: 1px solid var(--ring); border-radius: 8px; overflow: hidden; margin-bottom: 10px; }
+  .dir-toggle button { border: none; border-radius: 0; padding: 6px 16px; background: transparent; color: var(--ink-2); }
+  .dir-toggle button.on-tx { background: var(--series-1); color: #fff; }
+  .dir-toggle button.on-rx { background: var(--series-2); color: #fff; }
+  pre.hex, pre.text-block, pre.json-block {
+    background: var(--page); border: 1px solid var(--grid); border-radius: 8px;
+    padding: 10px 12px; font: 11.5px/1.5 var(--mono); overflow: auto;
+    max-height: 340px; white-space: pre; color: var(--ink-2); margin: 0 0 12px;
+  }
+  pre.hex .asc { color: var(--ink-3); }
+  .interp { border: 1px solid var(--grid); border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
+  .interp > .head {
+    padding: 6px 12px; background: var(--surface-2); font-size: 12.5px;
+    display: flex; gap: 8px; align-items: center;
+  }
+  .interp > .head .summary { color: var(--ink-2); margin-left: auto; font-size: 12px; }
+  .interp > .body { padding: 8px 12px; }
+  .interp table { font-size: 12.5px; }
+  .interp td.label { color: var(--ink-3); width: 160px; }
+  .interp.err > .head { color: var(--critical); }
+  .muted-link { color: var(--ink-3); text-decoration: underline; cursor: pointer; background: none; border: none; padding: 0; font: inherit; }
+
+  /* ---- 解析模式 ---- */
+  #payloadMode { min-width: 200px; }
+  pre.http-start { background: var(--surface-2); border: none; padding: 6px 12px; font: 12.5px var(--mono); color: var(--ink-1);
+    border-radius: 8px 8px 0 0; margin: 0; white-space: pre-wrap; word-break: break-all; }
+  .http-head-table { border: 1px solid var(--grid); border-top: none; border-radius: 0 0 8px 8px; margin-bottom: 12px; }
+
+  /* ---- 弹窗提示 ---- */
+  .toast-stack { position: fixed; top: 16px; right: 16px; z-index: 60; display: flex; flex-direction: column;
+    gap: 8px; max-width: 400px; }
+  .toast { background: var(--surface-2); border: 1px solid var(--ring); border-left: 3px solid var(--warning);
+    border-radius: 8px; padding: 10px 14px; font-size: 12.5px; color: var(--ink-1);
+    box-shadow: 0 8px 24px rgba(0,0,0,.5); animation: toast-in .15s ease-out; }
+  .toast.error { border-left-color: var(--critical); }
+  .toast b { display: block; margin-bottom: 2px; }
+  .toast .detail { color: var(--ink-2); }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(-6px); } }
+
+  /* ---- 解读器 ---- */
+  .interp-list .item { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--grid); }
+  .interp-list .item:last-child { border-bottom: none; }
+  .switch { position: relative; width: 34px; height: 19px; flex: none; cursor: pointer; }
+  .switch input { position: absolute; opacity: 0; width: 100%; height: 100%; cursor: pointer; margin: 0; }
+  .switch .slide { position: absolute; inset: 0; background: var(--surface-2);
+    border: 1px solid var(--ring); border-radius: 999px; transition: background .15s; }
+  .switch .slide::after { content: ""; position: absolute; left: 3px; top: 3px; width: 11px; height: 11px;
+    border-radius: 50%; background: var(--ink-3); transition: left .15s, background .15s; }
+  .switch input:checked + .slide { background: rgba(57,135,229,.35); }
+  .switch input:checked + .slide::after { left: 18px; background: var(--series-1); }
+  .code-editor { display: grid; grid-template-columns: 1fr; gap: 10px; }
+  .code-editor .fields { display: flex; gap: 10px; flex-wrap: wrap; }
+  .two-col { display: grid; grid-template-columns: 1.1fr .9fr; gap: 16px; }
+  @media (max-width: 960px) { .two-col { grid-template-columns: 1fr; } }
+  footer { color: var(--ink-3); font-size: 12px; padding: 20px 24px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>SocketMeasure</h1>
+  <span class="sub">Socket 端口收发测量 · 解读器动态扩展 · 数据仅存内存</span>
+  <label class="theme-switch">主题
+    <select id="themeSelect">
+      <option value="auto">跟随系统</option>
+      <option value="dark">暗夜</option>
+      <option value="light">日间</option>
+    </select>
+  </label>
+  <span class="since" id="uptime"></span>
+</header>
+
+<nav class="tabs">
+  <button data-tab="dashboard" class="active">仪表盘</button>
+  <button data-tab="sessions">会话</button>
+  <button data-tab="interpreters">解读器</button>
+  <button data-tab="export">导出 / 关于</button>
+</nav>
+
+<main>
+  <!-- ================= 仪表盘 ================= -->
+  <section id="tab-dashboard">
+    <div class="tiles" id="tiles"></div>
+
+    <div class="panel chart-wrap-chart">
+      <h2>总吞吐速率（最近 120 秒，每秒采样）</h2>
+      <div class="chart-wrap" id="chartWrap">
+        <canvas id="rateChart"></canvas>
+        <div class="tooltip" id="chartTip"></div>
+      </div>
+      <div class="chart-legend">
+        <span><span class="sw" style="background:var(--series-1)"></span>客户端 → 目标（tx 上行）</span>
+        <span><span class="sw" style="background:var(--series-2)"></span>目标 → 客户端（rx 下行）</span>
+      </div>
+    </div>
+
+    <div class="two-col">
+      <div class="panel">
+        <h2>监听器（端口转发规则）</h2>
+        <table id="listenerTable">
+          <thead><tr>
+            <th>名称</th><th class="num">监听端口</th><th>目标</th><th>状态</th>
+            <th class="num">会话</th><th class="num">发 (tx)</th><th class="num">收 (rx)</th><th></th>
+          </tr></thead>
+          <tbody id="listenerBody"></tbody>
+        </table>
+        <form id="addListenerForm" class="form-row" style="margin-top:12px">
+          <label>名称 <input name="name" placeholder="如 echo" size="10"></label>
+          <label>监听端口 <input name="listen_port" type="number" min="1" max="65535" required></label>
+          <label>目标主机 <input name="target_host" placeholder="127.0.0.1" size="14"></label>
+          <label>目标端口 <input name="target_port" type="number" min="1" max="65535"></label>
+          <button class="primary" type="submit">＋ 创建监听器</button>
+        </form>
+        <p class="hint" style="margin:8px 0 0">客户端访问「本机:监听端口」即被透明转发到目标并开始计量。</p>
+      </div>
+
+      <div class="panel">
+        <h2>事件流</h2>
+        <ul class="events" id="eventList"></ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 会话 ================= -->
+  <section id="tab-sessions" class="hidden">
+    <div class="panel">
+      <h2>会话列表</h2>
+      <table>
+        <thead><tr>
+          <th>状态</th><th>客户端</th><th>目标</th><th>经监听端口</th>
+          <th class="num">发 (tx)</th><th class="num">收 (rx)</th>
+          <th class="num">tx 包</th><th class="num">rx 包</th>
+          <th class="num">速率 ↑/↓</th><th class="num">时长</th>
+        </tr></thead>
+        <tbody id="sessionBody"></tbody>
+      </table>
+    </div>
+    <div id="sessionDetail" class="hidden"></div>
+  </section>
+
+  <!-- ================= 解读器 ================= -->
+  <section id="tab-interpreters" class="hidden">
+    <div class="two-col">
+      <div class="panel">
+        <h2>已注册解读器 <span class="hint">（注册信息与代码仅存内存）</span></h2>
+        <div class="interp-list" id="interpList"></div>
+      </div>
+      <div class="panel">
+        <h2>在线编写并注册自定义解读器</h2>
+        <div class="code-editor">
+          <div class="fields">
+            <label>ID <input id="newInterpId" placeholder="如 mqtt" size="14"></label>
+            <label>标题 <input id="newInterpTitle" placeholder="如 MQTT 解析" size="16"></label>
+            <label><input type="checkbox" id="newInterpEnabled" checked> 注册后启用</label>
+          </div>
+          <textarea id="newInterpCode" spellcheck="false" placeholder="def interpret(payload: bytes, meta: dict):&#10;    # payload: 本方向已捕获的负载字节&#10;    # meta: 包含 direction / client / target / bytes / pkts / duration_s 等&#10;    return {&#10;        &#34;summary&#34;: f&#34;收到 {len(payload)} 字节&#34;,&#10;        &#34;text&#34;: payload[:200].decode(&#34;utf-8&#34;, errors=&#34;replace&#34;),&#10;    }"></textarea>
+          <div class="form-row">
+            <button class="primary" id="registerInterpBtn">注册解读器</button>
+            <button id="testInterpBtn">试运行（不注册）</button>
+            <span class="hint">自定义代码以当前进程权限执行，请仅运行可信代码</span>
+          </div>
+          <div id="testResult"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 导出 ================= -->
+  <section id="tab-export" class="hidden">
+    <div class="panel">
+      <h2>下载测量结果</h2>
+      <p class="hint" style="margin:0 0 12px">
+        导出文件在请求时由内存数据即时生成，浏览器下载完成后工具本身不在磁盘保留任何数据。
+      </p>
+      <div class="form-row">
+        <button class="primary" data-download="/api/export?format=json">下载完整 JSON（含负载与解读结果）</button>
+        <button data-download="/api/export?format=json&amp;scope=sessions">下载会话 JSON</button>
+        <button data-download="/api/export?format=csv">下载会话汇总 CSV</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>关于</h2>
+      <p class="hint" style="margin:0">
+        SocketMeasure 通过透明 TCP 端口转发测量 socket 收发流量，会话详情支持多种解析模式
+        （Raw / ASCII / UTF-8 / JSON / HTTP 报文 / URL 表单 / Base64 / Hex 文本，浏览器端尝试解析，
+        失败弹窗并回退 Raw），并可热注册自定义解读器。面板默认只监听 127.0.0.1，无鉴权，请勿暴露到公网。
+        捕获上限、保留会话数等参数见 <code>--help</code>。
+      </p>
+    </div>
+  </section>
+</main>
+
+<footer>SocketMeasure 0.1.0 · 测量数据仅存内存 · uv run python -m socketmeasure</footer>
+
+<script>
+"use strict";
+/* ================= 工具函数 ================= */
+const $ = (s, root = document) => root.querySelector(s);
+const $$ = (s, root = document) => Array.from(root.querySelectorAll(s));
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+function fmtBytes(n) {
+  if (n === undefined || n === null) return "—";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let v = n, i = 0;
+  while (Math.abs(v) >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return i === 0 ? `${v} B` : `${v.toFixed(2)} ${units[i]}`;
+}
+function fmtRate(bps) { return bps == null ? "—" : fmtBytes(bps) + "/s"; }
+function pad2(n) { return String(n).padStart(2, "0"); }
+function fmtTime(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+function fmtDur(s) {
+  if (s == null) return "—";
+  return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+}
+
+/* ================= 全局状态 ================= */
+const App = {
+  state: null,
+  eventSeq: 0,
+  tab: "dashboard",
+  selectedSessionId: null,
+  detailDir: "tx",
+  detailMode: "raw",
+  chart: { canvas: null, ctx: null, series: null, hover: null },
+};
+
+/* ================= 主题切换 ================= */
+const THEME_KEY = "socketmeasure.theme";
+const themeMedia = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+let themeChoice = "auto";
+
+function effectiveTheme(choice) {
+  if (choice === "light" || choice === "dark") return choice;
+  return themeMedia && themeMedia.matches ? "dark" : "light";
+}
+
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+/* #rrggbb -> rgba(r,g,b,a)，用于十字准线等半透明主题色 */
+function hexA(hex, a) {
+  const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex || "");
+  if (!m) return hex;
+  return `rgba(${parseInt(m[1], 16)},${parseInt(m[2], 16)},${parseInt(m[3], 16)},${a})`;
+}
+
+function applyTheme(choice) {
+  themeChoice = choice;
+  document.documentElement.dataset.theme = effectiveTheme(choice);
+  try { localStorage.setItem(THEME_KEY, choice); } catch (e) { /* 隐私模式等场景忽略 */ }
+  drawChart();
+}
+
+$("#themeSelect").addEventListener("change", e => applyTheme(e.target.value));
+if (themeMedia) themeMedia.addEventListener("change", () => {
+  if (themeChoice === "auto") applyTheme("auto");
+});
+(function initTheme() {
+  let saved = "auto";
+  try { saved = localStorage.getItem(THEME_KEY) || "auto"; } catch (e) {}
+  if (!["auto", "dark", "light"].includes(saved)) saved = "auto";
+  $("#themeSelect").value = saved;
+  applyTheme(saved);
+})();
+
+/* ================= 选项卡 ================= */
+$$("nav.tabs button").forEach(btn => btn.addEventListener("click", () => {
+  App.tab = btn.dataset.tab;
+  $$("nav.tabs button").forEach(b => b.classList.toggle("active", b === btn));
+  $$("main > section").forEach(s => s.classList.toggle("hidden", s.id !== `tab-${App.tab}`));
+  if (App.tab === "sessions" && App.selectedSessionId) loadSessionDetail(App.selectedSessionId);
+  if (App.tab === "interpreters") renderInterpreters();
+}));
+
+/* ================= 仪表盘 ================= */
+function renderTiles(st) {
+  const t = st.totals;
+  $("#tiles").innerHTML = `
+    <div class="tile"><div class="label">会话总数</div><div class="value">${t.sessions}</div></div>
+    <div class="tile"><div class="label">进行中会话</div><div class="value">${t.open}</div></div>
+    <div class="tile tx"><div class="label">累计发送 tx（上行）</div><div class="value">${fmtBytes(t.bytes_tx)}</div></div>
+    <div class="tile rx"><div class="label">累计接收 rx（下行）</div><div class="value">${fmtBytes(t.bytes_rx)}</div></div>
+    <div class="tile tx"><div class="label">当前发送速率</div><div class="value">${fmtRate(t.rate_tx_bps)}</div></div>
+    <div class="tile rx"><div class="label">当前接收速率</div><div class="value">${fmtRate(t.rate_rx_bps)}</div></div>
+    <div class="tile"><div class="label">监听器</div><div class="value">${st.listeners.length}</div></div>`;
+  const dur = (st.now - st.started_at);
+  $("#uptime").textContent = `运行 ${fmtDur(dur)} · 捕获上限 ${fmtBytes(st.capture_limit)}/方向`;
+}
+
+function renderListeners(st) {
+  const body = $("#listenerBody");
+  if (!st.listeners.length) {
+    body.innerHTML = `<tr><td colspan="8" style="color:var(--ink-3)">暂无监听器，使用下方表单创建。</td></tr>`;
+    return;
+  }
+  body.innerHTML = st.listeners.map(l => `
+    <tr>
+      <td>${esc(l.name)}</td>
+      <td class="num">${l.listen_port}</td>
+      <td>${esc(l.target)}</td>
+      <td>${l.running ? '<span class="pill open">运行中</span>' : '<span class="pill failed">已停止</span>'}</td>
+      <td class="num">${l.open_sessions}/${l.sessions}</td>
+      <td class="num" style="color:var(--series-1)">${fmtBytes(l.bytes_tx)}</td>
+      <td class="num" style="color:var(--series-2)">${fmtBytes(l.bytes_rx)}</td>
+      <td><button class="danger" data-remove-listener="${l.id}">删除</button></td>
+    </tr>`).join("");
+  $$("[data-remove-listener]", body).forEach(b =>
+    b.addEventListener("click", () => {
+      if (!confirm("删除该监听器？进行中的会话将断开。")) return;
+      fetch(`/api/listeners/${b.dataset.removeListener}`, { method: "DELETE" })
+        .then(r => r.json()).then(poll).catch(() => poll());
+    }));
+}
+
+$("#addListenerForm").addEventListener("submit", e => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = {
+    name: fd.get("name"),
+    listen_port: Number(fd.get("listen_port")),
+    target_host: fd.get("target_host") || "127.0.0.1",
+    target_port: fd.get("target_port") ? Number(fd.get("target_port")) : Number(fd.get("listen_port")),
+  };
+  fetch("/api/listeners", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then(r => r.json()).then(j => {
+    if (j.error) alert("创建失败：" + j.error);
+    else { e.target.reset(); poll(); }
+  }).catch(() => alert("创建失败：网络错误"));
+});
+
+/* ================= 事件流 ================= */
+function pollEvents() {
+  fetch(`/api/events?since=${App.eventSeq}`).then(r => r.json()).then(data => {
+    const list = data.events || [];
+    if (!list.length) return;
+    App.eventSeq = list[list.length - 1].seq;
+    const el = $("#eventList");
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    el.insertAdjacentHTML("beforeend", list.map(ev => `
+      <li class="${ev.kind === "error" ? "error" : ""}">
+        <span class="t">${fmtTime(ev.ts)}</span><b>${esc(ev.kind)}</b> ${esc(ev.message)}
+      </li>`).join(""));
+    if (atBottom) el.scrollTop = el.scrollHeight;
+    while (el.children.length > 200) el.removeChild(el.firstChild);
+  }).catch(() => {});
+}
+
+/* ================= 吞吐图表 ================= */
+function setupChart() {
+  const cv = $("#rateChart");
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  App.chart.canvas = cv; App.chart.ctx = ctx;
+}
+
+function drawChart() {
+  const { ctx, canvas, series, hover } = App.chart;
+  if (!ctx) return;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+  const padL = 58, padR = 14, padT = 12, padB = 24;
+  const plotW = w - padL - padR, plotH = h - padT - padB;
+
+  if (!series || series.length < 2) {
+    ctx.fillStyle = cssVar("--ink-3");
+    ctx.font = "13px system-ui";
+    ctx.textAlign = "center";
+    ctx.fillText("暂无数据 —— 创建监听器并产生流量后此处开始绘制", w / 2, h / 2);
+    return;
+  }
+  const colTx = cssVar("--series-1") || "#3987e5";
+  const colRx = cssVar("--series-2") || "#d95926";
+  const txPts = series.map(p => p[1]), rxPts = series.map(p => p[2]);
+  const tMin = series[0][0], tMax = series[series.length - 1][0];
+  let vMax = Math.max(...txPts, ...rxPts, 1024) * 1.15;
+
+  // 网格与坐标轴（recessive）
+  ctx.strokeStyle = cssVar("--grid"); ctx.lineWidth = 1;
+  ctx.fillStyle = cssVar("--ink-3"); ctx.font = "11px system-ui";
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + plotH - (plotH * i / 4);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+    ctx.fillText(fmtRate(vMax * i / 4), padL - 8, y);
+  }
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  const tickCount = 5;
+  for (let i = 0; i <= tickCount; i++) {
+    const t = tMin + (tMax - tMin) * i / tickCount;
+    const x = padL + plotW * i / tickCount;
+    ctx.fillText(fmtTime(t), x, h - padB + 6);
+  }
+
+  const xOf = t => padL + plotW * (t - tMin) / Math.max(tMax - tMin, 1e-6);
+  const yOf = v => padT + plotH - plotH * v / vMax;
+
+  // 面积填充（低透明度）+ 2px 细线
+  const drawSeries = (pts, color) => {
+    ctx.beginPath();
+    pts.forEach((v, i) => {
+      const x = xOf(series[i][0]), y = yOf(v);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.save();
+    ctx.lineTo(xOf(series[series.length - 1][0]), padT + plotH);
+    ctx.lineTo(xOf(series[0][0]), padT + plotH);
+    ctx.closePath();
+    ctx.fillStyle = color + "22";
+    ctx.fill();
+    ctx.restore();
+    ctx.beginPath();
+    pts.forEach((v, i) => {
+      const x = xOf(series[i][0]), y = yOf(v);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = "round";
+    ctx.stroke();
+  };
+  drawSeries(txPts, colTx);
+  drawSeries(rxPts, colRx);
+
+  // 悬停十字准线
+  if (hover != null) {
+    const x = xOf(hover.t);
+    if (x >= padL && x <= w - padR) {
+      ctx.strokeStyle = hexA(cssVar("--ink-1") || "#f0efec", 0.35);
+      ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH); ctx.stroke();
+      ctx.setLineDash([]);
+      [[colTx, hover.tx], [colRx, hover.rx]].forEach(([c, v]) => {
+        const y = yOf(v);
+        ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2);
+        ctx.fillStyle = c; ctx.fill();
+        ctx.strokeStyle = cssVar("--surface-1") || "#1a1a19"; ctx.lineWidth = 2; ctx.stroke();
+      });
+    }
+  }
+}
+
+function chartHover(ev) {
+  const wrap = $("#chartWrap");
+  const rect = wrap.getBoundingClientRect();
+  const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+  const series = App.chart.series;
+  const tip = $("#chartTip");
+  if (!series || series.length < 2 || mx < 64) {
+    App.chart.hover = null; tip.style.display = "none"; drawChart();
+    return;
+  }
+  const cv = App.chart.canvas;
+  const padL = 58, padR = 14;
+  const plotW = cv.clientWidth - padL - padR;
+  const tMin = series[0][0], tMax = series[series.length - 1][0];
+  const t = tMin + (tMax - tMin) * (mx - padL) / plotW;
+  let best = series[0], bestD = Infinity;
+  series.forEach(p => { const d = Math.abs(p[0] - t); if (d < bestD) { bestD = d; best = p; } });
+  App.chart.hover = { t: best[0], tx: best[1], rx: best[2] };
+  drawChart();
+  tip.style.display = "block";
+  tip.innerHTML = `<div class="tt">${fmtTime(best[0])}</div>
+    <div class="row"><span class="dot" style="background:${cssVar("--series-1") || "#3987e5"}"></span>tx 上行 ${fmtRate(best[1])}</div>
+    <div class="row"><span class="dot" style="background:${cssVar("--series-2") || "#d95926"}"></span>rx 下行 ${fmtRate(best[2])}</div>`;
+  const tipW = tip.offsetWidth || 150;
+  tip.style.left = Math.min(Math.max(mx + 14, 8), rect.width - tipW - 8) + "px";
+  tip.style.top = Math.max(my - 10, 8) + "px";
+}
+
+$("#chartWrap").addEventListener("mousemove", chartHover);
+$("#chartWrap").addEventListener("mouseleave", () => {
+  App.chart.hover = null; $("#chartTip").style.display = "none"; drawChart();
+});
+window.addEventListener("resize", () => { setupChart(); drawChart(); });
+
+/* ================= 会话 ================= */
+function renderSessions(st) {
+  const body = $("#sessionBody");
+  if (!st.sessions.length) {
+    body.innerHTML = `<tr><td colspan="10" style="color:var(--ink-3)">暂无会话。</td></tr>`;
+    return;
+  }
+  body.innerHTML = st.sessions.map(s => `
+    <tr class="session-row ${s.id === App.selectedSessionId ? "selected" : ""}" data-session="${s.id}">
+      <td><span class="pill ${s.state}">${s.state === "open" ? "进行中" : s.state === "failed" ? "失败" : "已关闭"}</span></td>
+      <td>${esc(s.client)}</td><td>${esc(s.target)}</td><td class="num">${s.listen_port}</td>
+      <td class="num" style="color:var(--series-1)">${fmtBytes(s.bytes_tx)}</td>
+      <td class="num" style="color:var(--series-2)">${fmtBytes(s.bytes_rx)}</td>
+      <td class="num">${s.pkts_tx}</td><td class="num">${s.pkts_rx}</td>
+      <td class="num">${fmtRate(s.rate_tx_bps)} / ${fmtRate(s.rate_rx_bps)}</td>
+      <td class="num">${fmtDur(s.duration_s)}</td>
+    </tr>`).join("");
+  $$(".session-row", body).forEach(row => row.addEventListener("click", () => {
+    App.selectedSessionId = row.dataset.session;
+    App.detailDir = "tx";
+    App.detailMode = "raw";
+    $$(".session-row", body).forEach(r => r.classList.toggle("selected", r === row));
+    loadSessionDetail(App.selectedSessionId);
+  }));
+}
+
+function hexdump(bytes, limit = 4096) {
+  const shown = Math.min(bytes.length, limit);
+  const lines = [];
+  for (let i = 0; i < shown; i += 16) {
+    const chunk = bytes.subarray(i, Math.min(i + 16, shown));
+    const hex = Array.from(chunk, b => b.toString(16).padStart(2, "0")).join(" ").padEnd(48, " ");
+    const asc = Array.from(chunk, b => (b >= 32 && b < 127) ? String.fromCharCode(b) : ".").join("");
+    lines.push(`${i.toString(16).padStart(8, "0")}  <span class="asc">${hex}  ${esc(asc)}</span>`);
+  }
+  if (bytes.length > limit) lines.push(`… 共 ${bytes.length} 字节，仅显示前 ${limit} 字节`);
+  return lines.join("\n");
+}
+
+function b64ToBytes(b64) {
+  const bin = atob(b64 || "");
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/* ================= 负载解析模式（浏览器端，失败弹窗并回退 Raw） ================= */
+const PARSE_MODES = [
+  { id: "raw",    label: "Raw（十六进制转储）" },
+  { id: "ascii",  label: "文本（仅 ASCII）" },
+  { id: "utf8",   label: "文本（UTF-8）" },
+  { id: "json",   label: "JSON" },
+  { id: "http",   label: "HTTP 报文" },
+  { id: "form",   label: "URL 表单编码" },
+  { id: "base64", label: "Base64 文本解码" },
+  { id: "hexstr", label: "Hex 文本解码" },
+];
+
+function decodeFatal(bytes, modeName) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (e) {
+    throw Error(`含非 UTF-8 字节，无法按${modeName}解析`);
+  }
+}
+
+function httpView(payload) {
+  const text = decodeFatal(payload, "HTTP 文本");
+  const m = text.match(/^([A-Z]{1,16}) (\S+) (HTTP\/\d(?:\.\d)?)\r?\n/)
+        || text.match(/^(HTTP\/\d(?:\.\d)?) (\d{3})(?:[ \t]+(.*))?\r?\n/);
+  if (!m) throw Error("首行不是 HTTP 请求行或状态行");
+  const lines = text.split(/\r?\n/);
+  const headers = [];
+  let i = 1, bodyStart = -1;
+  for (; i < lines.length; i++) {
+    const l = lines[i];
+    if (l === "") { bodyStart = i + 1; break; }
+    const idx = l.indexOf(":");
+    if (idx < 0) throw Error(`第 ${i + 1} 行不是合法的头部字段`);
+    headers.push([l.slice(0, idx).trim(), l.slice(idx + 1).trim()]);
+  }
+  const isResp = m[1].startsWith("HTTP/");
+  const startLine = isResp ? `响应 · ${m[1]} ${m[2]} ${m[3] || ""}` : `请求 · ${m[1]} ${m[2]} ${m[3]}`;
+  const headTable = headers.length
+    ? `<table class="http-head-table"><tbody>${headers.map(([k, v]) =>
+        `<tr><td class="label">${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}</tbody></table>`
+    : `<div class="hint" style="margin-bottom:12px">（无头部字段）</div>`;
+  let body = "";
+  if (bodyStart >= 0) {
+    const rest = lines.slice(bodyStart).join("\n").replace(/\n+$/, "");
+    if (rest.length) body = `<div class="hint" style="margin:0 0 4px">消息体（${rest.length} 字符）：</div><pre class="text-block">${esc(rest.slice(0, 2048))}${rest.length > 2048 ? "\n…（截断）" : ""}</pre>`;
+  }
+  return `<pre class="http-start">${esc(startLine)}</pre>${headTable}${body}`;
+}
+
+function formView(payload) {
+  const text = decodeFatal(payload, "表单文本");
+  const t = text.trim();
+  if (!/^[^\s=&+#]+(=[^&]*)?(&[^\s=&+#]+(=[^&]*)?)*$/.test(t) || !t.includes("="))
+    throw Error("不是 application/x-www-form-urlencoded 结构（键=值&键=值）");
+  const rows = Array.from(new URLSearchParams(t).entries());
+  if (!rows.length) throw Error("未解析到任何键值对");
+  return `<table class="http-head-table"><tbody>${rows.map(([k, v]) =>
+    `<tr><td class="label">${esc(decodeURIComponent(k))}</td><td>${esc(decodeURIComponent(v))}</td></tr>`).join("")}
+    </tbody></table>`;
+}
+
+function base64View(payload) {
+  const t = decodeFatal(payload, "Base64 文本").replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(t) || t.length % 4 !== 0)
+    throw Error("字符集或长度不合法（需 4 的倍数，含正确的 = 填充）");
+  let bin;
+  try { bin = atob(t); } catch (e) { throw Error("Base64 解码失败"); }
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  const printable = Array.from(out).filter(b => b >= 32 && b < 127).length;
+  const body = printable / Math.max(out.length, 1) > 0.9
+    ? `<pre class="text-block">${esc(new TextDecoder("ascii").decode(out))}</pre>`
+    : `<pre class="hex">${hexdump(out, 2048)}</pre>`;
+  return `<div class="hint" style="margin:0 0 4px">解码得到 ${fmtBytes(out.length)}：</div>${body}`;
+}
+
+function hexstrView(payload) {
+  const t = decodeFatal(payload, "Hex 文本").replace(/\s+/g, "");
+  if (!/^[0-9a-fA-F]+$/.test(t) || t.length % 2 !== 0)
+    throw Error("不是偶数长度的十六进制字符（0-9a-f）");
+  const out = new Uint8Array(t.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(t.substr(i * 2, 2), 16);
+  return `<div class="hint" style="margin:0 0 4px">解码得到 ${fmtBytes(out.length)}：</div><pre class="hex">${hexdump(out, 2048)}</pre>`;
+}
+
+/* 按解析模式渲染负载视图；解析失败时抛出 Error，由调用方弹窗并回退 Raw */
+function renderPayloadView(payload, mode) {
+  if (!payload.length) return `<div class="hint">该方向暂无负载数据。</div>`;
+  switch (mode) {
+    case "raw":
+      return `<pre class="hex">${hexdump(payload)}</pre>`;
+    case "ascii": {
+      for (const b of payload)
+        if (!((b === 9 || b === 10 || b === 13) || (b >= 32 && b < 127)))
+          throw Error(`含非 ASCII 字节（0x${b.toString(16).padStart(2, "0")}）`);
+      return `<pre class="text-block">${esc(new TextDecoder("ascii").decode(payload))}</pre>`;
+    }
+    case "utf8":
+      return `<pre class="text-block">${esc(decodeFatal(payload, "UTF-8 文本"))}</pre>`;
+    case "json": {
+      const v = JSON.parse(decodeFatal(payload, "JSON 文本").replace(/^﻿/, ""));
+      return `<pre class="json-block">${esc(JSON.stringify(v, null, 2))}</pre>`;
+    }
+    case "http":
+      return httpView(payload);
+    case "form":
+      return formView(payload);
+    case "base64":
+      return base64View(payload);
+    case "hexstr":
+      return hexstrView(payload);
+    default:
+      return `<pre class="hex">${hexdump(payload)}</pre>`;
+  }
+}
+
+/* 弹窗提示（自动消失） */
+function showToast(title, detail, kind) {
+  let stack = $(".toast-stack");
+  if (!stack) {
+    stack = document.createElement("div");
+    stack.className = "toast-stack";
+    document.body.appendChild(stack);
+  }
+  const el = document.createElement("div");
+  el.className = "toast " + (kind || "");
+  el.innerHTML = `<b>${esc(title)}</b>${detail ? `<span class="detail">${esc(detail)}</span>` : ""}`;
+  stack.appendChild(el);
+  setTimeout(() => {
+    el.style.transition = "opacity .3s";
+    el.style.opacity = "0";
+    setTimeout(() => el.remove(), 320);
+  }, 4500);
+}
+
+function renderInterpResult(res) {
+  if (res == null) return `<div class="hint">（无输出）</div>`;
+  if (typeof res === "string") return `<pre class="text-block">${esc(res)}</pre>`;
+  if (typeof res !== "object") return `<pre class="text-block">${esc(JSON.stringify(res))}</pre>`;
+  const parts = [];
+  if (Array.isArray(res)) {
+    return `<ul style="margin:0;padding-left:18px">${res.map(r =>
+      `<li>${typeof r === "object" ? esc(JSON.stringify(r, null, 2)) : esc(r)}</li>`).join("")}</ul>`;
+  }
+  if (res.text) parts.push(`<pre class="text-block">${esc(res.text)}</pre>`);
+  if (Array.isArray(res.rows) && res.rows.length) {
+    parts.push(`<table><tbody>${res.rows.map(r =>
+      `<tr><td class="label">${esc(r.label || "")}</td><td>${esc(r.value == null ? "" : r.value)}</td></tr>`).join("")}
+      </tbody></table>`);
+  }
+  if (Array.isArray(res.list) && res.list.length) {
+    parts.push(`<ul style="margin:0;padding-left:18px">${res.list.map(r =>
+      `<li>${typeof r === "object" ? esc(JSON.stringify(r, null, 2)) : esc(r)}</li>`).join("")}</ul>`);
+  }
+  if (!parts.length && res.summary) parts.push(`<div class="hint">${esc(res.summary)}</div>`);
+  if (!parts.length) parts.push(`<pre class="json-block">${esc(JSON.stringify(res, null, 2))}</pre>`);
+  return parts.join("");
+}
+
+function renderSessionDetail(det) {
+  const sm = det;
+  const dir = App.detailDir;
+  const payload = b64ToBytes(det.payload_b64[dir]);
+  const interps = (det.interpret || {})[dir] || [];
+  const trunc = sm.truncated[dir];
+  const host = $("#sessionDetail");
+  host.classList.remove("hidden");
+  host.innerHTML = `
+    <div class="panel">
+      <h2>会话 ${sm.id} <span class="pill ${sm.state}">${sm.state === "open" ? "进行中" : sm.state === "failed" ? "失败" : "已关闭"}</span></h2>
+      <div class="detail-grid">
+        <div class="cell"><div class="k">客户端</div><div class="v">${esc(sm.client)}</div></div>
+        <div class="cell"><div class="k">目标</div><div class="v">${esc(sm.target)}</div></div>
+        <div class="cell"><div class="k">经监听端口</div><div class="v">${sm.listen_port}（${esc(sm.listener_name)}）</div></div>
+        <div class="cell"><div class="k">起止时间</div><div class="v">${fmtTime(sm.started_at)} → ${fmtTime(sm.ended_at)}（${fmtDur(sm.duration_s)}）</div></div>
+        <div class="cell"><div class="k">发 / 收</div><div class="v"><span style="color:var(--series-1)">${fmtBytes(sm.bytes_tx)}</span>
+          <span style="color:var(--ink-3)"> / </span><span style="color:var(--series-2)">${fmtBytes(sm.bytes_rx)}</span></div></div>
+        <div class="cell"><div class="k">报文 tx / rx</div><div class="v">${sm.pkts_tx} / ${sm.pkts_rx}</div></div>
+        <div class="cell"><div class="k">错误</div><div class="v">${esc(sm.error || "无")}</div></div>
+      </div>
+      <div class="dir-toggle">
+        <button id="dirTx" class="${dir === "tx" ? "on-tx" : ""}">客户端 → 目标（tx）</button>
+        <button id="dirRx" class="${dir === "rx" ? "on-rx" : ""}">目标 → 客户端（rx）</button>
+      </div>
+      <div class="form-row" style="margin-bottom:10px">
+        <button class="primary" id="reInterpretBtn">重新解读</button>
+        <button data-download-payload="${dir}" data-session-id="${sm.id}">下载该方向原始负载</button>
+        <span class="hint">已捕获 ${fmtBytes(payload.length)}${trunc ? `（已达 ${fmtBytes(sm.capture_limit)} 上限，样本截断）` : ""}</span>
+      </div>
+      <div class="form-row" style="margin:14px 0 8px; align-items:flex-end">
+        <label>解析模式
+          <select id="payloadMode">
+            ${PARSE_MODES.map(m => `<option value="${m.id}" ${App.detailMode === m.id ? "selected" : ""}>${m.label}</option>`).join("")}
+          </select>
+        </label>
+        <span class="hint">选中的模式会尝试解析当前方向负载；解析失败将弹窗提示并回退到 Raw。</span>
+      </div>
+      <div id="payloadView">${renderPayloadView(payload, App.detailMode)}</div>
+      <h2 style="margin-top:14px">解读结果（${interps.length} 个解读器）</h2>
+      <div id="interpResults">
+        ${interps.length ? interps.map(r => `
+          <div class="interp ${r.result && r.result.error ? "err" : ""}">
+            <div class="head"><b>${esc(r.title)}</b>
+              <span class="pill badge">${r.kind === "custom" ? "自定义" : "内置"}</span>
+              <span class="summary">${esc((r.result && r.result.summary) || "")}</span>
+            </div>
+            <div class="body">${renderInterpResult(r.result)}</div>
+          </div>`).join("") : `<div class="hint">没有启用的解读器产生结果 — 可前往「解读器」页启用或注册。</div>`}
+      </div>
+    </div>`;
+  $("#dirTx").addEventListener("click", () => { App.detailDir = "tx"; renderSessionDetail(det); });
+  $("#dirRx").addEventListener("click", () => { App.detailDir = "rx"; renderSessionDetail(det); });
+  $("#payloadMode").addEventListener("change", e => {
+    const mode = e.target.value;
+    const label = (PARSE_MODES.find(m => m.id === mode) || {}).label || mode;
+    try {
+      $("#payloadView").innerHTML = renderPayloadView(payload, mode);
+      App.detailMode = mode;
+    } catch (err) {
+      e.target.value = "raw";
+      App.detailMode = "raw";
+      $("#payloadView").innerHTML = renderPayloadView(payload, "raw");
+      showToast(`解析失败：${label}`, `${err.message} — 已回退到 Raw`, "error");
+    }
+  });
+  $("#reInterpretBtn").addEventListener("click", () => loadSessionDetail(sm.id, true));
+  $("[data-download-payload]").addEventListener("click", e => {
+    const b = e.currentTarget;
+    window.location.href = `/api/sessions/${b.dataset.sessionId}/payload?direction=${b.dataset.downloadPayload}&encoding=bin`;
+  });
+}
+
+function loadSessionDetail(id, force) {
+  const url = `/api/sessions/${id}` + (force ? "/interpret" : "");
+  fetch(url).then(r => r.json()).then(data => {
+    if (data.error) { alert(data.error); return; }
+    renderSessionDetail(data.session);
+  }).catch(() => {});
+}
+
+/* ================= 解读器管理 ================= */
+function renderInterpreters() {
+  const list = $("#interpList");
+  const items = (App.state && App.state.interpreters) || [];
+  list.innerHTML = items.map(i => `
+    <div class="item">
+      <label class="switch"><input type="checkbox" data-toggle-interp="${i.id}" ${i.enabled ? "checked" : ""}>
+        <span class="slide"></span></label>
+      <div style="min-width:120px"><b>${esc(i.title)}</b> <span class="hint">${esc(i.id)}</span></div>
+      <span class="pill badge">${i.kind === "custom" ? "自定义" : "内置"}</span>
+      <div class="hint" style="flex:1">${esc(i.description || "")}</div>
+      ${i.kind === "custom" ? `<span class="muted-link" data-view-code="${i.id}">查看源码</span>
+        <button class="danger" data-del-interp="${i.id}">删除</button>` : ""}
+    </div>`).join("");
+  $$("[data-toggle-interp]", list).forEach(cb => cb.addEventListener("change", () => {
+    fetch(`/api/interpreters/${cb.dataset.toggleInterp}/toggle`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: cb.checked }),
+    }).then(r => r.json()).then(poll).catch(() => poll());
+  }));
+  $$("[data-del-interp]", list).forEach(b => b.addEventListener("click", () => {
+    if (!confirm(`删除自定义解读器 ${b.dataset.delInterp}？`)) return;
+    fetch(`/api/interpreters/${b.dataset.delInterp}`, { method: "DELETE" })
+      .then(r => r.json()).then(poll).catch(() => poll());
+  }));
+  $$("[data-view-code]", list).forEach(a => a.addEventListener("click", () => {
+    fetch(`/api/interpreters/${a.dataset.viewCode}/code`).then(r => r.json()).then(data => {
+      $("#newInterpId").value = data.id;
+      $("#newInterpTitle").value = data.title;
+      $("#newInterpCode").value = data.code;
+    }).catch(() => {});
+  }));
+}
+
+function showTestResult(result) {
+  $("#testResult").innerHTML = `
+    <div class="interp ${result && result.error ? "err" : ""}" style="margin-top:8px">
+      <div class="head"><b>试运行输出</b><span class="summary">${esc((result && result.summary) || "")}</span></div>
+      <div class="body">${renderInterpResult(result)}</div>
+    </div>`;
+}
+
+$("#registerInterpBtn").addEventListener("click", () => {
+  const body = {
+    id: $("#newInterpId").value.trim(),
+    title: $("#newInterpTitle").value.trim(),
+    code: $("#newInterpCode").value,
+    enabled: $("#newInterpEnabled").checked,
+  };
+  if (!body.id) { alert("请填写解读器 ID"); return; }
+  fetch("/api/interpreters", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then(r => r.json()).then(j => {
+    if (j.error) { alert("注册失败：" + j.error); return; }
+    poll();
+    renderInterpreters();
+  }).catch(() => alert("注册失败：网络错误"));
+});
+
+$("#testInterpBtn").addEventListener("click", () => {
+  const sel = App.state && App.state.sessions ? App.state.sessions[0] : null;
+  const body = { code: $("#newInterpCode").value, direction: App.detailDir || "tx" };
+  if (sel) body.session_id = sel.id;
+  fetch("/api/interpreters-test", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then(r => r.json()).then(j => {
+    if (j.error) { alert("试运行失败：" + j.error); return; }
+    showTestResult(j.result);
+  }).catch(() => alert("试运行失败：网络错误"));
+});
+
+/* ================= 导出 ================= */
+$$("[data-download]").forEach(b => b.addEventListener("click", () => {
+  window.location.href = b.dataset.download;
+}));
+
+/* ================= 轮询主循环 ================= */
+function poll() {
+  fetch("/api/state").then(r => r.json()).then(st => {
+    App.state = st;
+    renderTiles(st);
+    renderListeners(st);
+    setupChart();
+    App.chart.series = st.series;
+    drawChart();
+    if (App.tab === "dashboard") renderSessions(st);
+    if (App.tab === "sessions") renderSessions(st);
+    if (App.tab === "interpreters") renderInterpreters();
+  }).catch(() => {});
+}
+
+setupChart();
+poll();
+pollEvents();
+setInterval(poll, 1500);
+setInterval(pollEvents, 1500);
+</script>
+</body>
+</html>
