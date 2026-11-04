@@ -53,6 +53,7 @@
   header h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: .2px; }
   header .sub { color: var(--ink-3); font-size: 12.5px; }
   header .since { color: var(--ink-3); font-size: 12px; margin-left: auto; font-variant-numeric: tabular-nums; }
+  header .ver { font: 12px var(--mono); color: var(--ink-3); border: 1px solid var(--axis); border-radius: 6px; padding: 1px 7px; }
   header .theme-switch { display: flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: 12.5px; }
   header .theme-switch select { padding: 4px 8px; font-size: 12.5px; }
   nav.tabs { display: flex; gap: 4px; padding: 10px 24px 0; }
@@ -110,6 +111,10 @@
   .pill.closed { color: var(--ink-3); }
   .pill.failed { color: var(--critical); border-color: rgba(208,59,59,.45); }
   .pill.badge { color: var(--ink-2); }
+  .pill.proto { color: var(--ink-3); }
+  .pill.proto.websocket { color: var(--good); border-color: rgba(12,163,12,.4); }
+  .pill.proto.tls { color: var(--warning); }
+  .pill.proto.http, .pill.proto.tcp { color: var(--ink-2); }
 
   /* ---- 表单 / 按钮 ---- */
   button, input, select, textarea {
@@ -169,6 +174,18 @@
     border-radius: 8px 8px 0 0; margin: 0; white-space: pre-wrap; word-break: break-all; }
   .http-head-table { border: 1px solid var(--grid); border-top: none; border-radius: 0 0 8px 8px; margin-bottom: 12px; }
 
+  /* ---- WebSocket 解析 ---- */
+  .ws-table { border: 1px solid var(--grid); border-radius: 8px; margin-bottom: 12px; }
+  .ws-table td.label { color: var(--ink-3); width: 190px; white-space: nowrap; }
+  pre.ws-frames {
+    font-size: 12px; line-height: 1.6; white-space: pre; margin: 0 0 12px;
+  }
+  pre.ws-frames .op-close { color: var(--critical); }
+  pre.ws-frames .op-ctrl { color: var(--warning); }
+  pre.ws-frames .op-cont { color: var(--ink-3); }
+  pre.ws-frames .note { color: var(--warning); }
+  pre.ws-frames .dim { color: var(--ink-3); }
+
   /* ---- 弹窗提示 ---- */
   .toast-stack { position: fixed; top: 16px; right: 16px; z-index: 60; display: flex; flex-direction: column;
     gap: 8px; max-width: 400px; }
@@ -223,6 +240,7 @@
 
 <header>
   <h1>SocketMeasure</h1>
+  <span class="ver" id="headVersion">v0.2.0</span>
   <span class="sub">Socket 端口收发测量 · 解读器动态扩展 · 数据仅存内存</span>
   <label class="theme-switch">主题
     <select id="themeSelect">
@@ -292,7 +310,7 @@
       <h2>会话列表</h2>
       <table>
         <thead><tr>
-          <th>状态</th><th>客户端</th><th>目标</th><th>经监听端口</th>
+          <th>状态</th><th>协议</th><th>客户端</th><th>目标</th><th>经监听端口</th>
           <th class="num">发 (tx)</th><th class="num">收 (rx)</th>
           <th class="num">tx 包</th><th class="num">rx 包</th>
           <th class="num">速率 ↑/↓</th><th class="num">时长</th>
@@ -375,15 +393,17 @@
       <h2>关于</h2>
       <p class="hint" style="margin:0">
         SocketMeasure 通过透明 TCP 端口转发测量 socket 收发流量，会话详情支持多种解析模式
-        （Raw / ASCII / UTF-8 / JSON / HTTP 报文 / URL 表单 / Base64 / Hex 文本，浏览器端尝试解析，
-        失败弹窗并回退 Raw），并可热注册自定义解读器。面板默认只监听 127.0.0.1，无鉴权，请勿暴露到公网。
+        （Raw / ASCII / UTF-8 / JSON / HTTP 报文 / URL 表单 / Base64 / Hex 文本 / WebSocket 帧，
+        浏览器端尝试解析，失败弹窗并回退 Raw），并可热注册自定义解读器。
+        识别为 WebSocket 的会话可按「报文」逐条查看（RFC 6455 帧装配，与 TCP 分段无关）。
+        面板默认只监听 127.0.0.1，无鉴权，请勿暴露到公网。
         捕获上限、保留会话数等参数见 <code>--help</code>。
       </p>
     </div>
   </section>
 </main>
 
-<footer>SocketMeasure 0.1.0 · 测量数据仅存内存 · uv run python -m socketmeasure</footer>
+<footer>SocketMeasure <span id="footVersion">0.2.0</span> · 测量数据仅存内存 · uv run python -m socketmeasure</footer>
 
 <script>
 "use strict";
@@ -391,6 +411,15 @@
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => Array.from(root.querySelectorAll(s));
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+/* 版本号：服务端注入 window.SM_VERSION（来自 socketmeasure/_version.py），
+   页头徽标与页脚同步显示；取不到时回落到 HTML 里的静态文本 */
+if (window.SM_VERSION) {
+  const headVer = document.querySelector("#headVersion");
+  if (headVer) headVer.textContent = "v" + window.SM_VERSION;
+  const footVer = document.querySelector("#footVersion");
+  if (footVer) footVer.textContent = window.SM_VERSION;
+}
 
 function fmtBytes(n) {
   if (n === undefined || n === null) return "—";
@@ -400,6 +429,11 @@ function fmtBytes(n) {
   return i === 0 ? `${v} B` : `${v.toFixed(2)} ${units[i]}`;
 }
 function fmtRate(bps) { return bps == null ? "—" : fmtBytes(bps) + "/s"; }
+/* 会话应用层协议（wsproto.detect_protocol 结果）的展示名 */
+function protocolLabel(p) {
+  return p === "websocket" ? "WebSocket" : p === "http" ? "HTTP" : p === "tls" ? "TLS"
+    : p === "tcp" ? "TCP" : "未定论";
+}
 function pad2(n) { return String(n).padStart(2, "0"); }
 function fmtTime(ts) {
   if (!ts) return "—";
@@ -450,6 +484,9 @@ const App = {
   selectedSessionId: null,
   detailDir: "tx",
   detailMode: "raw",
+  detailMsgSeq: null,      /* 会话详情当前查看的报文序号；null = 该方向合并负载 */
+  detailRenderId: 0,       /* 异步加载报文时的版本号，防止切换后旧请求覆盖新视图 */
+  detailMsg: null,         /* detailMsgSeq 对应的报文元数据（含 payload_b64 缓存） */
   chart: { canvas: null, ctx: null, series: null, hover: null },
 };
 
@@ -711,12 +748,13 @@ window.addEventListener("resize", () => { setupChart(); drawChart(); });
 function renderSessions(st) {
   const body = $("#sessionBody");
   if (!st.sessions.length) {
-    body.innerHTML = `<tr><td colspan="10" style="color:var(--ink-3)">暂无会话。</td></tr>`;
+    body.innerHTML = `<tr><td colspan="11" style="color:var(--ink-3)">暂无会话。</td></tr>`;
     return;
   }
   body.innerHTML = st.sessions.map(s => `
     <tr class="session-row ${s.id === App.selectedSessionId ? "selected" : ""}" data-session="${s.id}">
       <td><span class="pill ${s.state}">${s.state === "open" ? "进行中" : s.state === "failed" ? "失败" : "已关闭"}</span></td>
+      <td><span class="pill proto ${s.protocol || "unknown"}">${protocolLabel(s.protocol)}</span></td>
       <td>${esc(s.client)}</td><td>${esc(s.target)}</td><td class="num">${s.listen_port}</td>
       <td class="num" style="color:var(--series-1)">${fmtBytes(s.bytes_tx)}</td>
       <td class="num" style="color:var(--series-2)">${fmtBytes(s.bytes_rx)}</td>
@@ -728,6 +766,8 @@ function renderSessions(st) {
     App.selectedSessionId = row.dataset.session;
     App.detailDir = "tx";
     App.detailMode = "raw";
+    App.detailMsgSeq = null;
+    App.detailMsg = null;
     $$(".session-row", body).forEach(r => r.classList.toggle("selected", r === row));
     loadSessionDetail(App.selectedSessionId);
   }));
@@ -763,6 +803,7 @@ const PARSE_MODES = [
   { id: "form",   label: "URL 表单编码" },
   { id: "base64", label: "Base64 文本解码" },
   { id: "hexstr", label: "Hex 文本解码" },
+  { id: "ws",     label: "WebSocket 帧" },
 ];
 
 function decodeFatal(bytes, modeName) {
@@ -839,7 +880,330 @@ function hexstrView(payload) {
 }
 
 /* 按解析模式渲染负载视图；解析失败时抛出 Error，由调用方弹窗并回退 Raw */
-function renderPayloadView(payload, mode) {
+/* ================= WebSocket（RFC 6455）浏览器端解析 =================
+   与后端 wsproto 同构：帧边界与 recv 边界无关，解析总是作用于某方向
+   拼接后的完整字节流；帧头/掩码/长度不完整时标记（不完整帧）而非报错。 */
+const WS_MAX_SCAN = 16384;
+const WS_MAX_FRAMES = 4096;
+const WS_OPCODE_NAMES = { 0: "continuation", 1: "text", 2: "binary", 8: "close", 9: "ping", 10: "pong" };
+
+function wsOpcodeName(op) {
+  if (op == null) return "不完整";
+  return WS_OPCODE_NAMES[op] || "reserved(0x" + op.toString(16).padStart(2, "0") + ")";
+}
+
+/* 在流前缀中定位 HTTP 头部结束偏移（首个空行之后）；找不到返回 -1 */
+function wsHeadEnd(payload) {
+  const n = Math.min(payload.length, WS_MAX_SCAN);
+  for (let i = 0; i + 4 <= n; i++) {
+    if (payload[i] === 13 && payload[i + 1] === 10 && payload[i + 2] === 13 && payload[i + 3] === 10) return i + 4;
+  }
+  for (let i = 0; i + 2 <= n; i++) {
+    if (payload[i] === 10 && payload[i + 1] === 10) return i + 2;
+  }
+  return -1;
+}
+
+function wsLatin1(payload, end) {
+  let s = "";
+  for (let i = 0; i < end; i++) s += String.fromCharCode(payload[i]);
+  return s;
+}
+
+/* 解析流首的 HTTP 头（识别 Upgrade 握手用）；不完整或含坏行返回 null */
+function wsParseHead(payload) {
+  const end = wsHeadEnd(payload);
+  if (end < 0) return null;
+  const lines = wsLatin1(payload, end).replace(/\r/g, "").split("\n");
+  const startLine = (lines[0] || "").trim();
+  if (!startLine) return null;
+  const headers = [];
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) break;
+    const idx = line.indexOf(":");
+    if (idx < 0) return null;
+    headers.push([line.slice(0, idx).trim(), line.slice(idx + 1).trim()]);
+  }
+  return { startLine, headers, end };
+}
+
+function wsHeader(head, name) {
+  const nl = name.toLowerCase();
+  return head.headers.filter(h => h[0].toLowerCase() === nl).map(h => h[1]).join(", ");
+}
+
+/* RFC 6455 §4.1：Upgrade: websocket 且 Sec-WebSocket-Key 为 24 字符合法 base64 */
+function isWsHandshakeRequest(head) {
+  if (!/^[A-Z]{1,20} \S+ HTTP\/[0-9]\.[0-9]$/.test(head.startLine)) return false;
+  const tokens = wsHeader(head, "Upgrade").toLowerCase().split(",").map(t => t.trim());
+  return tokens.includes("websocket")
+    && /^[A-Za-z0-9+/]{22}==$/.test(wsHeader(head, "Sec-WebSocket-Key"));
+}
+
+function isWsHandshakeResponse(head) {
+  const m = /^HTTP\/[0-9]\.[0-9] (\d{3})/.exec(head.startLine);
+  if (!m || m[1] !== "101") return false;
+  return wsHeader(head, "Upgrade").toLowerCase().split(",").map(t => t.trim()).includes("websocket");
+}
+
+function looksLikeTlsBytes(payload) {
+  return payload.length >= 2 && [0x14, 0x15, 0x16, 0x17].includes(payload[0]) && payload[1] === 0x03;
+}
+
+/* 可恢复地解析帧流：按声明长度计数但不预分配；不完整一律标记 */
+function wsParseFrames(payload, start) {
+  const frames = [];
+  const n = payload.length;
+  let pos = start, capped = false;
+  while (pos < n) {
+    if (frames.length >= WS_MAX_FRAMES) { capped = true; break; }
+    if (pos + 2 > n) { frames.push({ tail: true, note: `帧头不完整（仅 ${n - pos} 字节）` }); break; }
+    const b0 = payload[pos], b1 = payload[pos + 1];
+    const fin = !!(b0 & 0x80), rsv = (b0 >> 4) & 0x07, opcode = b0 & 0x0F;
+    const masked = !!(b1 & 0x80), len7 = b1 & 0x7F;
+    let declared = len7, body = pos + 2;
+    const notes = [];
+    if (len7 === 126 || len7 === 127) {
+      const ext = len7 === 126 ? 2 : 8;
+      if (body + ext > n) { frames.push({ tail: true, note: `扩展长度字段不完整（需 ${ext} 字节）` }); break; }
+      declared = 0;
+      for (let i = 0; i < ext; i++) declared = declared * 256 + payload[body + i];
+      body += ext;
+      if (len7 === 127 && declared >= 9223372036854775808) notes.push("声明长度非法（最高有效位被置位）");
+      else if (len7 === 126 && declared < 126) notes.push(`非最小编码：2 字节扩展长度表示 ${declared}`);
+      else if (len7 === 127 && declared < 65536) notes.push(`非最小编码：8 字节扩展长度表示 ${declared}`);
+    }
+    let mask = null;
+    if (masked) {
+      if (body + 4 > n) { frames.push({ tail: true, note: "掩码字段不完整（需 4 字节）" }); break; }
+      mask = [payload[body], payload[body + 1], payload[body + 2], payload[body + 3]];
+      body += 4;
+    }
+    const take = Math.min(declared, n - body);       /* 不按声明长度预分配，只取实际到达的字节 */
+    let data = payload.subarray(body, body + take);
+    if (masked) {                                    /* RFC 6455 §5.3：payload[i] XOR mask[i & 3] */
+      const out = new Uint8Array(take);
+      for (let i = 0; i < take; i++) out[i] = data[i] ^ mask[i & 3];
+      data = out;
+    }
+    if (rsv) notes.push("RSV 位被置位（若协商了 permessage-deflate，负载是 DEFLATE 压缩数据）");
+    if (opcode >= 8) {
+      if (declared > 125) notes.push("控制帧负载超过 125 字节（协议违规）");
+      if (!fin) notes.push("控制帧被分片（协议违规）");
+    } else if (opcode !== 0 && opcode !== 1 && opcode !== 2) {
+      notes.push(`保留 opcode（0x${opcode.toString(16).padStart(2, "0")}）`);
+    }
+    frames.push({ index: frames.length, offset: pos, end: body + take, fin, rsv, opcode,
+      masked, declaredLen: declared, len: take, data, truncated: take < declared,
+      complete: take >= declared, notes });
+    pos = body + take;
+  }
+  return { frames, tailBytes: n - pos, capped };
+}
+
+function wsConcat(parts) {
+  let n = 0;
+  for (const p of parts) n += p.length;
+  const out = new Uint8Array(n);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+
+/* RFC 6455 §5.4：数据帧起始，续帧续接至 FIN；控制帧独立、可穿插在分片中间 */
+function wsAssembleMessages(frames) {
+  const messages = [];
+  let cur = null, stray = 0;
+  for (const f of frames) {
+    if (f.tail) continue;
+    if (f.opcode === 1 || f.opcode === 2) {
+      if (cur) { cur.finSeen = false; cur.truncated = true; messages.push(cur); cur = null; }
+      cur = { opcode: f.opcode, offset: f.offset, end: f.end, parts: [f.data], count: 1,
+        finSeen: f.fin, fragmented: false, truncated: f.truncated };
+    } else if (f.opcode === 0) {
+      if (!cur) { stray++; continue; }
+      cur.fragmented = true; cur.parts.push(f.data); cur.count++;
+      cur.end = f.end;
+      if (f.truncated) cur.truncated = true;
+      if (f.fin) cur.finSeen = true;
+    }
+  }
+  if (cur) messages.push(cur);
+  let seq = 0;
+  return {
+    messages: messages.map(m => ({
+      seq: ++seq, opcode: m.opcode, offset: m.offset, end: m.end,
+      data: wsConcat(m.parts), frames: m.count,
+      finSeen: m.finSeen, fragmented: m.fragmented, truncated: m.truncated,
+    })),
+    stray,
+  };
+}
+
+/* 负载短预览：能严格按 UTF-8 解码给文本，否则给十六进制 */
+function wsPreview(bytes, limit) {
+  if (!bytes.length) return "";
+  const cut = bytes.length > limit;
+  const sub = bytes.subarray(0, limit);
+  try {
+    const t = new TextDecoder("utf-8", { fatal: true }).decode(sub);
+    return cut ? t + "…" : t;
+  } catch (e) { /* 二进制负载回退 hex */ }
+  let h = "";
+  for (let i = 0; i < sub.length; i++) h += sub[i].toString(16).padStart(2, "0");
+  return cut ? h + "…" : h;
+}
+
+/* RFC 6455 §5.5.1：关闭帧负载 = 2 字节状态码 + 可选 UTF-8 原因 */
+function wsCloseText(data) {
+  if (!data.length) return "无状态码";
+  const code = (data[0] << 8) | data[1];
+  let reason = "";
+  try { reason = new TextDecoder("utf-8", { fatal: true }).decode(data.subarray(2)); }
+  catch (e) { reason = Array.from(data.subarray(2), b => b.toString(16).padStart(2, "0")).join(""); }
+  return `${code} ${reason}`.trim();
+}
+
+function wsRowsHtml(rows) {
+  return `<table class="ws-table"><tbody>${rows.map(([k, v]) =>
+    `<tr><td class="label">${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}</tbody></table>`;
+}
+
+function wsHandshakeHtml(head) {
+  return `<pre class="http-start">${esc(head.startLine)}</pre>` + wsRowsHtml(head.headers);
+}
+
+/* 逐帧明细 + 装配报文清单（等宽文本块，opcode 着色） */
+function wsFrameText(frames, msgs) {
+  const limit = 64;
+  const lines = [];
+  for (const f of frames.slice(0, limit)) {
+    if (f.tail) { lines.push(`<span class="dim">（流尾不完整：${esc(f.note)}）</span>`); continue; }
+    const cls = f.opcode === 8 ? "op-close" : (f.opcode === 9 || f.opcode === 10) ? "op-ctrl"
+      : f.opcode === 0 ? "op-cont" : "";
+    const op = wsOpcodeName(f.opcode).padEnd(11, " ");
+    let line = `#${String(f.index + 1).padStart(3, "0")} ${f.fin ? "FIN " : "    "}`
+      + `<span class="${cls}">${esc(op)}</span>${f.masked ? "掩码" : "无掩码"} len=${f.declaredLen}`
+      + (f.truncated ? `（实际仅 ${f.len} 字节）` : "");
+    const pv = wsPreview(f.data, 32);
+    if (pv) line += ` 「${esc(pv)}」`;
+    if (f.notes.length) line += `<span class="note"> ｜ ${esc(f.notes.join("；"))}</span>`;
+    lines.push(line);
+  }
+  if (frames.length > limit) lines.push(`<span class="dim">… 共 ${frames.length} 帧，仅显示前 ${limit} 帧</span>`);
+  if (msgs.length) {
+    lines.push("");
+    lines.push('<span class="dim">── 装配报文（RFC 6455 §5.4，帧可跨 TCP 分段）──</span>');
+    for (const m of msgs.slice(0, 32)) {
+      const tag = [];
+      if (!m.finSeen) tag.push("未见 FIN");
+      if (m.fragmented) tag.push(`${m.frames} 帧`);
+      if (m.truncated) tag.push("样本截断");
+      const suffix = tag.length ? `<span class="note">（${esc(tag.join("，"))}）</span>` : "";
+      const pv = wsPreview(m.data, 48);
+      lines.push(`#${String(m.seq).padStart(3, "0")} ${wsOpcodeName(m.opcode).padEnd(8, " ")}`
+        + `len=${m.data.length}${suffix}` + (pv ? ` 「${esc(pv)}」` : ""));
+    }
+    if (msgs.length > 32) lines.push(`<span class="dim">… 共 ${msgs.length} 报文，仅显示前 32 报文</span>`);
+  }
+  return lines.join("\n");
+}
+
+/* 单报文作用域：负载是该 WebSocket 报文装配后的数据——帧头已剥离、掩码已解除，
+   因此不再按帧解析，直接展示报文内容（握手报文按 HTTP 头展示） */
+function wsMessageView(payload, dir, scope) {
+  const kind = scope.kind || "?";
+  const seq = scope.seq != null ? scope.seq : "?";
+  const rows = [["报文", `#${seq} ${kind}，${payload.length} 字节`]];
+  let notes = ["单报文作用域：负载为该报文装配后的数据（帧头已剥离、掩码已解除）"];
+  if (kind === "handshake") {
+    const head = wsParseHead(payload);
+    if (head) {
+      rows.push(["首行", head.startLine]);
+      for (const [k, v] of head.headers) rows.push([k, v]);
+      notes = ["单报文作用域：HTTP Upgrade 握手报文原文"];
+    } else {
+      rows.push(["首行", wsLatin1(payload, Math.min(payload.length, 80)).replace(/[^\x20-\x7e]/g, ".")]);
+    }
+  } else {
+    if (scope.opcode_name) rows.push(["opcode", scope.opcode_name]);
+    if (scope.fragmented) rows.push(["分片装配", `由 ${scope.frames} 帧拼接而成`]);
+    if (kind === "ws-close") rows.push(["关闭帧", wsCloseText(payload)]);
+    if (scope.truncated) notes.push("该报文不完整（未见 FIN 或捕获样本被截断）");
+  }
+  const pv = wsPreview(payload, 120);
+  return wsRowsHtml(rows)
+    + (pv ? `<div class="hint" style="margin:0 0 4px">报文内容预览：</div><pre class="text-block">${esc(pv)}</pre>` : "")
+    + `<pre class="hex">${hexdump(payload, 512)}</pre>`
+    + `<ul style="margin:0;padding-left:18px">${notes.map(n => `<li>${esc(n)}</li>`).join("")}</ul>`;
+}
+
+/* WebSocket 帧流解析（整方向流）。解析失败抛 Error，由调用方弹窗并回退 Raw。
+   dir 为 "tx"/"rx" 或缺失：缺失时跳过掩码方向合规提示（§5.3）。 */
+function wsView(payload, dir, scope) {
+  if (scope) return wsMessageView(payload, dir, scope);
+  if (looksLikeTlsBytes(payload))
+    throw Error("不是 WebSocket 流量（TLS 记录，需先解密才能看到 WebSocket 帧）");
+  const head = wsParseHead(payload);
+  let start = 0, hsHtml = "", handshakeLen = 0;
+  if (head) {
+    if (!isWsHandshakeRequest(head) && !isWsHandshakeResponse(head))
+      throw Error("不是 WebSocket 流量（HTTP 头部未携带 Upgrade: websocket）");
+    start = head.end;
+    handshakeLen = head.end;
+    hsHtml = wsHandshakeHtml(head);
+  }
+  const parsed = wsParseFrames(payload, start);
+  const frames = parsed.frames;
+  const real = frames.filter(f => !f.tail);
+  /* 无握手前缀时要求至少一个完整且 opcode 合法的帧，避免把任意字节误判为 WebSocket */
+  if (!handshakeLen && !real.some(f => f.complete && [1, 2, 8, 9, 10].includes(f.opcode)))
+    throw Error("不是 WebSocket 流量（未发现 RFC 6455 握手，也无可识别的数据帧）");
+  const assembled = wsAssembleMessages(frames);
+  const msgs = assembled.messages;
+  const rows = [["握手", handshakeLen ? `${handshakeLen} B（HTTP Upgrade）` : "无（负载不含 HTTP Upgrade 握手）"]];
+  rows.push(["帧数", `${real.length}（完整 ${real.filter(f => f.complete).length}）`]);
+  rows.push(["报文数", String(msgs.length)]);
+  const counts = {};
+  for (const f of real) { const name = wsOpcodeName(f.opcode); counts[name] = (counts[name] || 0) + 1; }
+  const dist = Object.keys(counts).sort().map(k => `${k}×${counts[k]}`).join("、");
+  if (dist) rows.push(["帧类型分布", dist]);
+  for (const f of real) {
+    if (f.opcode === 8) { rows.push(["关闭帧", wsCloseText(f.data)]); break; }
+  }
+  if (parsed.capped) rows.push(["帧数上限", `超过 ${WS_MAX_FRAMES}，后续帧未解析`]);
+  if (parsed.tailBytes) rows.push(["流尾余留", `${parsed.tailBytes} 字节属于不完整的帧`]);
+  if (assembled.stray) rows.push(["游离续帧", `${assembled.stray} 个续帧没有对应的起始数据帧（协议违规，已跳过）`]);
+  const notes = [];
+  if (real.length) {
+    const first = real[0];
+    if (real.some(f => f.masked !== first.masked))
+      notes.push("流中混有带掩码与不带掩码的帧（同一方向应一致，RFC 6455 §5.3）");
+    if (dir === "tx") {
+      const bare = real.filter(f => !f.masked).length;
+      if (bare) notes.push(`${bare} 帧 tx 未带掩码：客户端发出的帧必须带掩码（§5.3）`);
+    } else if (dir === "rx") {
+      const mk = real.filter(f => f.masked).length;
+      if (mk) notes.push(`${mk} 帧 rx 带了掩码：服务端发出的帧必须不带掩码（§5.3）`);
+    }
+  }
+  const badFrames = real.filter(f => f.notes.length).length;
+  if (badFrames) notes.push(`${badFrames} 帧带有协议提示（见下方帧明细）`);
+  const stats = `WebSocket：${real.length} 帧 / ${msgs.length} 报文`
+    + (handshakeLen ? `（握手 ${handshakeLen} B）` : "（无握手前缀）");
+  return `<div class="hint" style="margin:0 0 10px">${esc(stats)}</div>`
+    + hsHtml
+    + wsRowsHtml(rows)
+    + `<pre class="ws-frames">${wsFrameText(frames, msgs)}</pre>`
+    + (notes.length
+      ? `<ul style="margin:0;padding-left:18px">${notes.map(n => `<li>⚠ ${esc(n)}</li>`).join("")}</ul>`
+      : "");
+}
+
+/* 按解析模式渲染负载视图；解析失败时抛出 Error，由调用方弹窗并回退到 Raw。
+   dir / scope 为可选：dir 用于 WebSocket 掩码方向合规提示，scope 为单报文作用域。 */
+function renderPayloadView(payload, mode, dir, scope) {
   if (!payload.length) return `<div class="hint">该方向暂无负载数据。</div>`;
   switch (mode) {
     case "raw":
@@ -864,6 +1228,8 @@ function renderPayloadView(payload, mode) {
       return base64View(payload);
     case "hexstr":
       return hexstrView(payload);
+    case "ws":
+      return wsView(payload, dir, scope);
     default:
       return `<pre class="hex">${hexdump(payload)}</pre>`;
   }
@@ -912,10 +1278,90 @@ function renderInterpResult(res) {
   return parts.join("");
 }
 
+/* 报文下拉选项：合并负载 + 该方向已列出的报文 */
+function messageSelectOptions(det, dir) {
+  const msgs = ((det.messages || {})[dir] || []);
+  const opts = [`<option value="" ${App.detailMsgSeq == null ? "selected" : ""}>合并（该方向全部负载）</option>`];
+  for (const m of msgs) {
+    const label = `#${m.seq} ${m.kind} · ${fmtBytes(m.len)}` + (m.ts ? ` · ${fmtTime(m.ts)}` : "");
+    opts.push(`<option value="${m.seq}" ${App.detailMsgSeq === m.seq ? "selected" : ""}>${esc(label)}</option>`);
+  }
+  return opts.join("");
+}
+
+/* 报文作用域提示语：解析失败会弹窗并回退 Raw；报文过多时提示分页接口 */
+function messageScopeHint(det, dir) {
+  const listed = ((det.messages || {})[dir] || []).length;
+  const total = ((det.messages_total || {})[dir] || 0);
+  let text = "选中的模式会尝试解析当前所选报文（或合并负载）；解析失败将弹窗提示并回退到 Raw。";
+  if (total > listed) {
+    text += ` 该方向共 ${total} 条报文，列表仅显示前 ${listed} 条——可调用 ` +
+        `GET /api/sessions/${det.id}/messages?direction=${dir}&limit=&offset= 分页获取。`;
+  }
+  return text;
+}
+
+/* 渲染负载视图：合并负载直接取本地 b64，单报文按需拉取 /messages 并缓存 */
+function renderCurrentPayload(det) {
+  const renderId = ++App.detailRenderId;
+  const dir = App.detailDir;
+  const mode = App.detailMode;
+  const modeItem = PARSE_MODES.find(m => m.id === mode);
+  const modeLabel = modeItem ? modeItem.label : mode;
+  const host = $("#payloadView");
+  if (!host) return;
+
+  const paint = payload => {
+    if (renderId !== App.detailRenderId) return;   // 过期的回调不再渲染
+    const scope = App.detailMsgSeq != null ? App.detailMsg : null;
+    try {
+      host.innerHTML = renderPayloadView(payload, mode, dir, scope);
+    } catch (err) {
+      showToast(`解析失败：${modeLabel}`, (err && err.message ? err.message : String(err)) + " — 已回退到 Raw", "error");
+      App.detailMode = "raw";
+      const sel = $("#payloadMode");
+      if (sel) sel.value = "raw";
+      host.innerHTML = renderPayloadView(payload, "raw", dir, scope);
+    }
+  };
+
+  if (App.detailMsgSeq == null) {
+    paint(b64ToBytes(det.payload_b64[dir]));
+    return;
+  }
+  if (App.detailMsg && App.detailMsg.payload_b64) {
+    paint(b64ToBytes(App.detailMsg.payload_b64));
+    return;
+  }
+  host.innerHTML = `<div class="hint">正在加载报文 #${App.detailMsgSeq}（${esc(dir)}）…</div>`;
+  api(`/api/sessions/${det.id}/messages?direction=${dir}&limit=1&offset=${App.detailMsgSeq - 1}`)
+    .then(r => r.json())
+    .then(data => {
+      if (renderId !== App.detailRenderId) return;
+      const item = data && !data.error && data.messages && data.messages[0];
+      if (!item) {
+        showToast("加载报文失败", (data && data.error) || "未找到该报文", "error");
+        return;
+      }
+      App.detailMsg = item;
+      paint(b64ToBytes(item.payload_b64));
+    })
+    .catch(() => {
+      if (renderId !== App.detailRenderId) return;
+      showToast("加载报文失败", "网络错误，未能获取报文内容", "error");
+    });
+}
+
 function renderSessionDetail(det) {
   const sm = det;
   const dir = App.detailDir;
   const payload = b64ToBytes(det.payload_b64[dir]);
+  const fmtMsgCount = d => {
+    const total = (sm.messages_total || {})[d];
+    if (total == null) return "—";
+    const listed = ((sm.messages || {})[d] || []).length;
+    return total + (total > listed ? `（列表前 ${listed} 条）` : "");
+  };
   const interps = (det.interpret || {})[dir] || [];
   const trunc = sm.truncated[dir];
   const host = $("#sessionDetail");
@@ -927,10 +1373,12 @@ function renderSessionDetail(det) {
         <div class="cell"><div class="k">客户端</div><div class="v">${esc(sm.client)}</div></div>
         <div class="cell"><div class="k">目标</div><div class="v">${esc(sm.target)}</div></div>
         <div class="cell"><div class="k">经监听端口</div><div class="v">${sm.listen_port}（${esc(sm.listener_name)}）</div></div>
+        <div class="cell"><div class="k">协议</div><div class="v"><span class="pill proto ${sm.protocol || "unknown"}">${protocolLabel(sm.protocol)}</span></div></div>
         <div class="cell"><div class="k">起止时间</div><div class="v">${fmtTime(sm.started_at)} → ${fmtTime(sm.ended_at)}（${fmtDur(sm.duration_s)}）</div></div>
         <div class="cell"><div class="k">发 / 收</div><div class="v"><span style="color:var(--series-1)">${fmtBytes(sm.bytes_tx)}</span>
           <span style="color:var(--ink-3)"> / </span><span style="color:var(--series-2)">${fmtBytes(sm.bytes_rx)}</span></div></div>
-        <div class="cell"><div class="k">报文 tx / rx</div><div class="v">${sm.pkts_tx} / ${sm.pkts_rx}</div></div>
+        <div class="cell"><div class="k">TCP 分段 tx / rx</div><div class="v">${sm.pkts_tx} / ${sm.pkts_rx}</div></div>
+        <div class="cell"><div class="k">报文 tx / rx</div><div class="v">${fmtMsgCount("tx")} / ${fmtMsgCount("rx")}</div></div>
         <div class="cell"><div class="k">错误</div><div class="v">${esc(sm.error || "无")}</div></div>
       </div>
       <div class="dir-toggle">
@@ -943,14 +1391,19 @@ function renderSessionDetail(det) {
         <span class="hint">已捕获 ${fmtBytes(payload.length)}${trunc ? `（已达 ${fmtBytes(sm.capture_limit)} 上限，样本截断）` : ""}</span>
       </div>
       <div class="form-row" style="margin:14px 0 8px; align-items:flex-end">
+        <label>报文
+          <select id="msgScope">
+            ${messageSelectOptions(sm, dir)}
+          </select>
+        </label>
         <label>解析模式
           <select id="payloadMode">
             ${PARSE_MODES.map(m => `<option value="${m.id}" ${App.detailMode === m.id ? "selected" : ""}>${m.label}</option>`).join("")}
           </select>
         </label>
-        <span class="hint">选中的模式会尝试解析当前方向负载；解析失败将弹窗提示并回退到 Raw。</span>
+        <span class="hint">${messageScopeHint(sm, dir)}</span>
       </div>
-      <div id="payloadView">${renderPayloadView(payload, App.detailMode)}</div>
+      <div id="payloadView"><div class="hint">加载中…</div></div>
       <h2 style="margin-top:14px">解读结果（${interps.length} 个解读器）</h2>
       <div id="interpResults">
         ${interps.length ? interps.map(r => `
@@ -963,20 +1416,22 @@ function renderSessionDetail(det) {
           </div>`).join("") : `<div class="hint">没有启用的解读器产生结果 — 可前往「解读器」页启用或注册。</div>`}
       </div>
     </div>`;
-  $("#dirTx").addEventListener("click", () => { App.detailDir = "tx"; renderSessionDetail(det); });
-  $("#dirRx").addEventListener("click", () => { App.detailDir = "rx"; renderSessionDetail(det); });
+  renderCurrentPayload(det);
+  $("#dirTx").addEventListener("click", () => {
+    App.detailDir = "tx"; App.detailMsgSeq = null; App.detailMsg = null; renderSessionDetail(det);
+  });
+  $("#dirRx").addEventListener("click", () => {
+    App.detailDir = "rx"; App.detailMsgSeq = null; App.detailMsg = null; renderSessionDetail(det);
+  });
+  $("#msgScope").addEventListener("change", e => {
+    const v = e.target.value;
+    App.detailMsgSeq = v ? Number(v) : null;
+    App.detailMsg = null;
+    renderCurrentPayload(det);
+  });
   $("#payloadMode").addEventListener("change", e => {
-    const mode = e.target.value;
-    const label = (PARSE_MODES.find(m => m.id === mode) || {}).label || mode;
-    try {
-      $("#payloadView").innerHTML = renderPayloadView(payload, mode);
-      App.detailMode = mode;
-    } catch (err) {
-      e.target.value = "raw";
-      App.detailMode = "raw";
-      $("#payloadView").innerHTML = renderPayloadView(payload, "raw");
-      showToast(`解析失败：${label}`, `${err.message} — 已回退到 Raw`, "error");
-    }
+    App.detailMode = e.target.value;
+    renderCurrentPayload(det);
   });
   $("#reInterpretBtn").addEventListener("click", () => loadSessionDetail(sm.id, true));
   $("[data-download-payload]").addEventListener("click", e => {

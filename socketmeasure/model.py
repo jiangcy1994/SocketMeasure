@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import base64
+import bisect
 import collections
 import csv
 import io
@@ -18,12 +19,24 @@ import threading
 import time
 import uuid
 
+from ._version import __version__
+from . import wsproto
+
 # 每个方向最多捕获的负载字节数（字节总计数不受限，仅捕获样本受限）
 DEFAULT_CAPTURE_LIMIT = 1 << 20            # 1 MiB
 DEFAULT_MAX_CLOSED_SESSIONS = 200          # 内存中最多保留的已关闭会话数
 DEFAULT_EVENT_LOG = 500                    # 事件流条数上限
 DEFAULT_API_CALL_LOG = 500                 # 外部 API 调用日志条数上限
 DEFAULT_RATE_SERIES = 120                  # 速率序列秒数上限
+
+# 逐报文视图（新增能力，均为增量字段，不改变既有接口形状）：
+# detail()/meta() 中 messages 列表条数上限；/messages 视图的 limit 上下限；
+# 逐报文解读的条数上限与全局墙钟预算（防止坏解读器拖垮详情请求）
+MSG_LIST_LIMIT = 64
+MSG_VIEW_LIMIT = 64
+MSG_VIEW_LIMIT_MAX = 256
+MSG_INTERP_LIMIT = 32
+MSG_INTERP_BUDGET_S = 8.0
 
 DIRECTIONS = ("tx", "rx")
 
@@ -74,6 +87,38 @@ def _fmt_bytes(n: float) -> str:
     return str(n)
 
 
+def _offset_index(starts, offset):
+    """字节偏移落在哪个分片内（starts 为各分片起始偏移，升序）。返回下标。"""
+    if not starts:
+        return -1
+    i = bisect.bisect_right(starts, offset) - 1
+    return i if i >= 0 else 0
+
+
+def _ws_view(parse):
+    """websocket 帧流的 API 视图：不含帧负载数据，只给短预览（省流量）。"""
+    frames = []
+    for f in parse["frames"]:
+        frames.append({
+            "index": (f["index"] + 1) if f["index"] is not None else None,
+            "offset": f["offset"], "end": f["end"],
+            "fin": f["fin"], "rsv": f["rsv"], "opcode": f["opcode"],
+            "opcode_name": f["opcode_name"], "masked": f["masked"],
+            "declared_len": f["declared_len"], "payload_len": f["payload_len"],
+            "complete": f["complete"], "truncated": f["truncated"],
+            "preview": wsproto.preview_bytes(f["payload"], 48),
+            "notes": list(f["notes"]),
+        })
+    return {
+        "handshake": parse["handshake"],
+        "handshake_len": parse["handshake_len"],
+        "tail_bytes": parse["tail_bytes"],
+        "frames_capped": parse["frames_capped"],
+        "stray_continuations": parse["stray_continuations"],
+        "frames": frames,
+    }
+
+
 class Session:
     """一条穿过转发监听器的 TCP 连接。线程安全。"""
 
@@ -100,9 +145,13 @@ class Session:
         self.captured = {d: 0 for d in DIRECTIONS}
         self.truncated = {d: False for d in DIRECTIONS}
         self._payload_version = {d: 0 for d in DIRECTIONS}
-        self._interp_cache = {}                         # direction -> (version, results)
+        self._interp_cache = {}                         # direction -> (version, protocol, results)
         self._rate_sample = {d: (time.time(), 0) for d in DIRECTIONS}
         self.rate = {d: 0.0 for d in DIRECTIONS}         # bytes/s
+        # 逐报文视图（新增）：协议识别结果、ws 帧流解析、报文分段，全部按负载版本缓存
+        self._protocol_cache = None                     # ((tx_ver, rx_ver), protocol)
+        self._ws_cache = {}                             # direction -> (version, ws parse)
+        self._blob_cache = {}                           # direction -> (version, [message blobs])
         self.lock = threading.RLock()
 
     # ---------------- 写入 ----------------
@@ -152,11 +201,200 @@ class Session:
         now = now if now is not None else time.time()
         return (self.ended_at or now) - self.started_at
 
+    # ---------------- 协议识别与逐报文视图（新增） ----------------
+
+    @property
+    def protocol(self) -> str:
+        """会话应用层协议：websocket / http / tls / tcp / unknown。
+
+        按 (tx 版本, rx 版本) 缓存——每方向每来一个分片最多重算一次，且只在
+        每方向前 16 KiB 上扫描（wsproto.MAX_SCAN）。一旦结论是 websocket
+        （服务端 101 已确认）就冻结：后续帧不可能推翻握手结论。
+        unknown 只出现在「头还没收齐 / 101 还在路上」时，会话关闭后落定为
+        http 或 tcp，避免长连接的 ws 会话被误判为 http。
+        """
+        with self.lock:
+            key = (self._payload_version["tx"], self._payload_version["rx"])
+            cached = self._protocol_cache
+            if cached is not None:
+                if cached[0] == key:
+                    return cached[1]
+                if cached[1] == "websocket":
+                    self._protocol_cache = (key, "websocket")
+                    return "websocket"
+            tx_head = self.payload("tx")[:wsproto.MAX_SCAN]
+            rx_head = self.payload("rx")[:wsproto.MAX_SCAN]
+            prot = wsproto.detect_protocol(tx_head, rx_head)
+            if prot == "unknown" and self.state != "open":
+                prot = "http" if wsproto.looks_like_http(tx_head) else "tcp"
+            self._protocol_cache = (key, prot)
+            return prot
+
+    def _chunk_ranges(self, direction):
+        """各分片的字节区间与序号：[(start, end, ts, seq), ...]。"""
+        out = []
+        off = 0
+        for i, (ts, d) in enumerate(self._chunks[direction]):
+            out.append((off, off + len(d), ts, i + 1))
+            off += len(d)
+        return out
+
+    def _ws_parse(self, direction):
+        """websocket 协议下解析整方向流：拆出 HTTP 握手前缀，再解析帧流并
+        装配报文。结果按该方向负载版本缓存（帧边界与 recv 边界无关，
+        必须在拼接流上解析，详见 wsproto 模块头注释）。"""
+        cached = self._ws_cache.get(direction)
+        if cached is not None and cached[0] == self._payload_version[direction]:
+            return cached[1]
+        data = self.payload(direction)
+        info, start = wsproto.split_handshake(data, direction)
+        parsed = wsproto.parse_frames(data, start)
+        assembled = wsproto.assemble_messages(parsed["frames"])
+        ranges = self._chunk_ranges(direction)
+        starts = [r[0] for r in ranges]
+        messages = []
+        for m in assembled["messages"]:
+            i = _offset_index(starts, m["offset"])
+            ts = ranges[i][2] if i >= 0 else None
+            messages.append({
+                "ts": ts, "len": m["payload_len"], "truncated": m["truncated"],
+                "kind": "ws-" + m["opcode_name"],
+                "opcode": m["opcode"], "opcode_name": m["opcode_name"],
+                "offset": m["offset"], "end": m["end"],
+                "frames": m["frames"], "fragmented": m["fragmented"],
+                "fin_seen": m["fin_seen"], "payload": m["payload"],
+            })
+        result = {
+            "handshake": info,
+            "handshake_len": start,
+            "frames": parsed["frames"],
+            "frames_capped": parsed["max_frames_hit"],
+            "tail_bytes": parsed["tail_bytes"],
+            "stray_continuations": assembled["stray_continuations"],
+            "messages": messages,
+        }
+        self._ws_cache[direction] = (self._payload_version[direction], result)
+        return result
+
+    def _message_blobs(self, direction, prot=None):
+        """该方向的报文分段（含负载数据）。协议感知：
+
+        - websocket：HTTP 握手作为第 1 条（kind=handshake），其后是按
+          RFC 6455 §5.4 装配的报文（可跨多个帧、跨多个 TCP 分段）
+        - 其它协议：按每次 recv 的分片边界切分（即「一个会话中的多个
+          tx/rx」，与 pkts 计数一一对应）
+
+        每项除报文字段外含 ``payload``（原始字节），按负载版本缓存。
+        """
+        with self.lock:
+            cached = self._blob_cache.get(direction)
+            if cached is not None and cached[0] == self._payload_version[direction]:
+                return cached[1]
+            prot = prot if prot is not None else self.protocol
+            chunks = self._chunks[direction]
+            last = len(chunks) - 1
+            truncated = self.truncated[direction]
+            blobs = []
+            if prot == "websocket":
+                parse = self._ws_parse(direction)
+                for m in parse["messages"]:
+                    blobs.append(dict(m, seq=0))
+                if parse["handshake"] is not None:
+                    # 握手前缀作为该方向第 1 条报文，负载即 HTTP 头部原文
+                    data = self.payload(direction)
+                    blobs.insert(0, {
+                        "seq": 0, "ts": chunks[0][0] if chunks else None,
+                        "len": parse["handshake_len"], "kind": "handshake",
+                        "truncated": False,
+                        "payload": data[:parse["handshake_len"]],
+                    })
+            else:
+                for i, (ts, d) in enumerate(chunks):
+                    blobs.append({
+                        "seq": 0, "ts": ts, "len": len(d), "kind": "recv",
+                        "truncated": bool(truncated and i == last), "payload": d,
+                    })
+            for i, b in enumerate(blobs):
+                b["seq"] = i + 1
+            self._blob_cache[direction] = (self._payload_version[direction], blobs)
+            return blobs
+
+    def messages(self, direction: str) -> list:
+        """报文分段的轻量列表（不含负载数据）：每项 {seq, ts, len, kind,
+        truncated}，websocket 报文另含 opcode/fragmented/frames/offset/end。
+        供 detail()/meta() 与报文选择器使用。"""
+        with self.lock:
+            return [{k: v for k, v in b.items() if k != "payload"}
+                    for b in self._message_blobs(direction)]
+
+    def messages_view(self, direction: str, limit: int = MSG_VIEW_LIMIT,
+                      offset: int = 0, run=None) -> dict:
+        """``GET /api/sessions/{id}/messages`` 的数据：单方向逐报文负载
+        （base64）+ 逐报文解读结果 + websocket 帧流概览。
+
+        ``run`` 为解读器注册表的运行函数时对返回的每条报文执行全部已启用
+        解读器（按 MSG_INTERP_LIMIT 条数与 MSG_INTERP_BUDGET_S 全局预算
+        截断，超限报文标记 ``interpret_skipped``）。
+        """
+        with self.lock:
+            prot = self.protocol
+            blobs = self._message_blobs(direction, prot)
+            total = len(blobs)
+            offset = max(0, min(offset, total))
+            limit = max(1, min(limit, MSG_VIEW_LIMIT_MAX))
+            sel = blobs[offset:offset + limit]
+            items = []
+            budget_deadline = time.monotonic() + MSG_INTERP_BUDGET_S
+            interp_capped = False
+            for i, b in enumerate(sel):
+                item = {
+                    "seq": b["seq"], "ts": b["ts"], "len": b["len"],
+                    "kind": b["kind"], "truncated": b["truncated"],
+                }
+                for extra in ("opcode", "opcode_name", "fragmented",
+                              "frames", "offset", "end"):
+                    if extra in b:
+                        item[extra] = b[extra]
+                # 解读器收到的 meta 里也会有同一条报文的描述
+                msg_meta = {"seq": b["seq"], "len": b["len"], "kind": b["kind"]}
+                for extra in ("opcode", "opcode_name", "fragmented", "frames"):
+                    if extra in b:
+                        msg_meta[extra] = b[extra]
+                item["payload_b64"] = base64.b64encode(b["payload"]).decode("ascii")
+                if run is not None and not interp_capped and i < MSG_INTERP_LIMIT:
+                    if time.monotonic() > budget_deadline:
+                        interp_capped = True
+                    else:
+                        meta = self.meta(direction)
+                        meta["message"] = msg_meta
+                        item["interpret"] = run(b["payload"], meta)
+                if "interpret" not in item:
+                    item["interpret_skipped"] = True
+                items.append(item)
+            view = {
+                "session_id": self.id,
+                "direction": direction,
+                "protocol": prot,
+                "truncated": self.truncated[direction],
+                "capture_limit": self.capture_limit,
+                "messages_total": total,
+                "returned": len(sel),
+                "offset": offset,
+                "limit": limit,
+                "interpret_capped": interp_capped,
+                "messages": items,
+            }
+            if prot == "websocket":
+                view["websocket"] = _ws_view(self._ws_parse(direction))
+            return view
+
     def meta(self, direction: str) -> dict:
         with self.lock:
+            msgs = self.messages(direction)
             return {
                 "session_id": self.id,
                 "direction": direction,
+                "protocol": self.protocol,
                 "listener_name": self.listener_name,
                 "listen_port": self.listen_port,
                 "client": f"{self.client_addr[0]}:{self.client_addr[1]}",
@@ -168,6 +406,11 @@ class Session:
                 "started_at": self.started_at,
                 "duration_s": round(self.duration(), 3),
                 "capture_limit": self.capture_limit,
+                # 新增：该方向的报文分段（轻量、截断至 MSG_LIST_LIMIT 条），
+                # 让解读器与对外 API 都能看到「一个会话中的多个 tx/rx」
+                "message_count": len(msgs),
+                "messages": msgs[:MSG_LIST_LIMIT],
+                "messages_capped": len(msgs) > MSG_LIST_LIMIT,
             }
 
     def summary(self) -> dict:
@@ -181,6 +424,7 @@ class Session:
                 "target": f"{self.target_addr[0]}:{self.target_addr[1]}",
                 "state": self.state,
                 "error": self.error,
+                "protocol": self.protocol,
                 "bytes_tx": self.bytes_tx,
                 "bytes_rx": self.bytes_rx,
                 "pkts_tx": self.pkts_tx,
@@ -196,7 +440,7 @@ class Session:
             }
 
     def detail(self, run_interpreters=None) -> dict:
-        """汇总摘要 + base64 负载 + 解读结果（按负载版本缓存）。"""
+        """汇总摘要 + base64 负载 + 解读结果（按 (负载版本, 协议) 缓存）。"""
         d = self.summary()
         with self.lock:
             payloads = {dr: b"".join(x[1] for x in self._chunks[dr]) for dr in DIRECTIONS}
@@ -204,20 +448,32 @@ class Session:
                                 for dr, p in payloads.items()}
             d["payload_version"] = dict(self._payload_version)
             d["capture_limit"] = self.capture_limit
+            # 新增：协议与双向报文分段（轻量、截断），供详情页报文选择器使用
+            prot = self.protocol
+            msgs = {dr: self.messages(dr) for dr in DIRECTIONS}
+            d["messages"] = {dr: msgs[dr][:MSG_LIST_LIMIT] for dr in DIRECTIONS}
+            d["messages_total"] = {dr: len(msgs[dr]) for dr in DIRECTIONS}
+            d["messages_capped"] = {dr: len(msgs[dr]) > MSG_LIST_LIMIT for dr in DIRECTIONS}
             if run_interpreters is not None:
                 results = {}
                 for dr in DIRECTIONS:
                     cached = self._interp_cache.get(dr)
-                    if cached is not None and cached[0] == self._payload_version[dr]:
-                        results[dr] = cached[1]
+                    if (cached is not None
+                            and cached[0] == self._payload_version[dr]
+                            and cached[1] == prot):
+                        results[dr] = cached[2]
                     else:
                         res = run_interpreters(payloads[dr], self.meta(dr))
-                        self._interp_cache[dr] = (self._payload_version[dr], res)
+                        self._interp_cache[dr] = (self._payload_version[dr], prot, res)
                         results[dr] = res
                 d["interpret"] = results
         return d
 
     def invalidate_interpretation(self) -> None:
+        """清除解读缓存（POST /api/sessions/{id}/interpret 调用）。
+
+        报文分段与协议识别只依赖负载本身，不受解读器变更影响，故只清解读缓存。
+        """
         with self.lock:
             self._interp_cache = {}
 
@@ -384,7 +640,7 @@ class Store:
                 "rate_rx_bps": round(sum(s.rate["rx"] for s in sessions), 1),
             }
             return {
-                "version": "0.1.0",
+                "version": __version__,
                 "started_at": self.started_at,
                 "now": time.time(),
                 "capture_limit": self.capture_limit,

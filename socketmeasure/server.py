@@ -23,6 +23,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from . import model
+from ._version import __version__
 from .model import Token
 from .proxy import create_listener
 
@@ -207,7 +209,7 @@ class PanelHandler(BaseHTTPRequestHandler):
             return self._ok({
                 "ok": True,
                 "service": "socketmeasure",
-                "version": "0.1.0",
+                "version": __version__,
                 "token_title": t.title if t else None,
                 "now": time.time(),
             })
@@ -371,6 +373,22 @@ class PanelHandler(BaseHTTPRequestHandler):
             session.invalidate_interpretation()
             return self._ok({"session": session.detail(self.registry.run)})
 
+        if len(rest) >= 2 and rest[1] == "messages" and method == "GET":
+            # 新增：逐报文视图——把一个会话中的多个 tx/rx 按协议边界拆开，
+            # 每条报文单独给出负载与解读结果（原有接口保持不变）
+            direction = query.get("direction", "tx")
+            if direction not in ("tx", "rx"):
+                raise ApiError("direction 只能是 tx 或 rx")
+            try:
+                limit = int(query.get("limit", model.MSG_VIEW_LIMIT))
+                offset = int(query.get("offset", "0"))
+            except ValueError:
+                raise ApiError("limit / offset 必须是整数")
+            if limit < 1 or offset < 0:
+                raise ApiError("limit >= 1 且 offset >= 0")
+            return self._ok(session.messages_view(direction, limit, offset,
+                                                   self.registry.run))
+
         if len(rest) >= 2 and rest[1] == "payload" and method == "GET":
             direction = query.get("direction", "tx")
             if direction not in ("tx", "rx"):
@@ -462,6 +480,7 @@ class PanelHandler(BaseHTTPRequestHandler):
             except Exception:
                 raise ApiError("payload_b64 不是合法的 base64")
             meta = {"direction": direction, "listen_port": None,
+                    "listener_name": None, "protocol": "unknown",
                     "client": "?", "target": "?",
                     "bytes": {"tx": len(payload), "rx": 0},
                     "pkts": {"tx": 1, "rx": 0},
@@ -469,7 +488,11 @@ class PanelHandler(BaseHTTPRequestHandler):
                     "capture_limit": self.store.capture_limit,
                     "session_id": None,
                     "captured": {"tx": len(payload), "rx": 0},
-                    "truncated": {"tx": False, "rx": False}}
+                    "truncated": {"tx": False, "rx": False},
+                    "message_count": 1,
+                    "messages": [{"seq": 1, "ts": None, "len": len(payload),
+                                  "kind": "recv", "truncated": False}],
+                    "messages_capped": False}
         try:
             result = self.registry.test_code(code, payload, meta)
         except ValueError as e:
@@ -512,9 +535,10 @@ class PanelHandler(BaseHTTPRequestHandler):
                     raise ApiError("面板页面缺失：static/index.html 不存在", 500)
                 html = path.read_text(encoding="utf-8")
                 # 注入面板内置令牌：面板自身调用全部 /api/* 时携带
+                # 同时注入版本号（来自 _version.py），页头/页脚与其保持一致
                 token_value = self.store.panel_token.value
-                inject = (f'<script>window.SM_PANEL_TOKEN='
-                          f'{json.dumps(token_value)};</script>')
+                inject = (f'<script>window.SM_PANEL_TOKEN={json.dumps(token_value)};'
+                          f'window.SM_VERSION={json.dumps(__version__)};</script>')
                 if "</head>" in html:
                     html = html.replace("</head>", inject + "</head>", 1)
                 else:

@@ -15,6 +15,30 @@
 
 方向约定：`tx` = 客户端 → 目标（上行），`rx` = 目标 → 客户端（下行）。
 
+## WebSocket 与逐报文解析
+
+转发流量的应用层协议会被自动识别（仅扫描每方向前 16 KiB，结论缓存）：
+
+| 协议 | 判定依据 |
+| --- | --- |
+| `websocket` | 客户端发出合法 HTTP Upgrade 握手且服务端已回 `101 Switching Protocols`（结论一旦成立即冻结） |
+| `http` | 普通 HTTP 请求/响应，或升级被服务端拒绝 |
+| `tls` | 流首是 TLS 记录头（字节级特征，**不解密**，仅识别） |
+| `tcp` | 其它裸字节流 |
+| `unknown` | 头尚未收齐 / 101 尚在途中（会话关闭后落定为 `http` 或 `tcp`） |
+
+识别为 `websocket` 的会话按 RFC 6455 解析：拆出 HTTP 握手前缀后逐帧解析
+（掩码解除、长度边界 125/126/127、控制帧与保留 opcode 的合规提示），
+再按 §5.4 把分片帧装配成完整报文——**帧边界与 recv 分段无关**，一个报文
+跨多个 TCP 分段、一个分段携带多帧、分片中间穿插 ping/pong 都能正确还原。
+TLS 流量不做解密，仅识别并提示。
+
+「一个会话中的多个 tx/rx」也得到支持：非 WebSocket 会话按每次 recv 的分段
+边界切分（与 `pkts` 计数一一对应），WebSocket 会话按装配后的报文边界切分，
+每条报文可单独查看与下载。会话详情页的「报文」下拉框用于切换合并负载与
+单条报文；外部工具用 `GET /api/sessions/{id}/messages` 分页获取（详见
+[docs/API.md](docs/API.md)）。
+
 ## 快速开始
 
 使用环境中的 [uv](https://docs.astral.sh/uv/) 运行：
@@ -61,13 +85,15 @@ def interpret(payload: bytes, meta: dict) -> str | dict:
 ```
 
 - `payload`：该方向的完整负载样本（可能被截断，见 `meta["truncated"]`）
-- `meta`：包含 `direction`、`listen_port`、`client`、`target`、`bytes`、
-  `pkts`、`captured`、`truncated`、`started_at`、`duration_s` 等
+- `meta`：包含 `direction`、`protocol`、`listen_port`、`client`、`target`、
+  `bytes`、`pkts`、`captured`、`truncated`、`started_at`、`duration_s`、
+  `message_count`、`messages` 等
 - 返回值：字符串，或字典（可含 `summary`、`text`、`rows`（键值表）、
   `list`（多块文本）键，面板会相应渲染）
 
 内置解读器：`stats`（统计）、`hexdump`（十六进制转储）、`text`（文本）、
-`http`（HTTP 请求解析）、`json`（JSON 美化）。
+`http`（HTTP 请求解析）、`json`（JSON 美化）、`wsframes`（WebSocket
+帧流解析与报文装配）。
 
 自定义解读器可在面板「解读器」页在线编辑、注册、试运行（`/api/interpreters-test`
 支持给定负载或直接引用某个会话的负载），启用/停用、删除。注册时代码会被
@@ -88,6 +114,7 @@ def interpret(payload: bytes, meta: dict) -> str | dict:
 | URL 表单编码 | 解析 `键=值&键=值`（自动 URL 解码） |
 | Base64 文本解码 | 解码后按可打印比例展示文本或 Hex |
 | Hex 文本解码 | 十六进制字符串解码为字节 |
+| WebSocket | RFC 6455 帧流解析：握手头部、逐帧明细、§5.4 报文装配与协议合规提示 |
 
 解析全部在浏览器端完成，不经过服务端；**解析失败会弹窗提示原因并自动回退到 Raw**。
 单元测试见 `tests/parse_modes_test.js`（`node tests/parse_modes_test.js`）。
@@ -118,6 +145,7 @@ def interpret(payload: bytes, meta: dict) -> str | dict:
 | GET | `/api/apicalls?since=N` | 外部调用日志 |
 | GET | `/api/sessions` | 会话列表 |
 | GET | `/api/sessions/{id}` | 会话详情（含 base64 负载与解读结果） |
+| GET | `/api/sessions/{id}/messages?direction=tx&limit=&offset=` | 逐报文视图：把会话中的多个 tx/rx 按协议边界拆开（**新增**） |
 | POST | `/api/sessions/{id}/interpret` | 清除解读缓存并重新解读 |
 | GET | `/api/sessions/{id}/payload?direction=tx&encoding=bin\|hex\|text` | 下载原始负载 |
 | GET | `/api/listeners` | 监听器列表 |
@@ -143,13 +171,27 @@ def interpret(payload: bytes, meta: dict) -> str | dict:
   记录在面板「令牌与调用」页，含时间、令牌、方法、路径、状态码、耗时，
   内存中保留最近 500 条；面板自身的调用不记录。
 
+## 版本号
+
+版本统一定义在 `socketmeasure/_version.py`（当前 `0.2.0`）：`/api/health` 与
+`/api/state` 均返回 `version` 字段，面板页头徽标与页脚显示同一值，
+`pyproject.toml` / `uv.lock` 中的版本保持同步。外部测试工具可读取
+`/api/health` 的 `version` 判断所连面板是否具备所需功能。
+
 ## 端到端测试
 
 ```bash
 # 1. 启动面板
 uv run python -m socketmeasure --port 8099 --forward echo:18080:127.0.0.1:18081
-# 2. 另开终端（脚本会自建回显目标）
+# 2. 另开终端（脚本会自建回显目标与 WebSocket 回显目标）
 uv run python tests/e2e_test.py
+```
+
+其它测试：
+
+```bash
+uv run python tests/test_wsproto.py   # RFC 6455 解析单元测试（含并发安全）
+node tests/parse_modes_test.js        # 浏览器端解析模式单元测试（含 WebSocket 视图）
 ```
 
 ## 安全说明
@@ -164,14 +206,17 @@ uv run python tests/e2e_test.py
 
 ```
 socketmeasure/
+  _version.py      版本号单一来源（API 与面板页面均引用）
   app.py           命令行入口、后台监控线程
   proxy.py         TCP 转发监听器（计量引擎）
   model.py         会话 / 存储 / 令牌 / 事件 / 导出（内存模型）
   interpreters.py  解读器注册表与内置解读器
+  wsproto.py       WebSocket（RFC 6455）纯函数解析模块
   server.py        Web 面板（REST API + 单页面）
   static/index.html  单文件控制台 UI
   __main__.py      python -m 入口
 docs/API.md             HTTP API 调用文档（含 curl/Python 示例）
-tests/e2e_test.py        端到端测试（Python）
-tests/parse_modes_test.js  负载解析模式单元测试（node 运行，无需浏览器）
+tests/e2e_test.py           端到端测试（Python，含 WebSocket 会话）
+tests/test_wsproto.py       RFC 6455 解析单元测试（Python）
+tests/parse_modes_test.js   负载解析模式单元测试（node 运行，无需浏览器）
 ```

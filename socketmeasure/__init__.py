@@ -4,10 +4,10 @@
 可通过 Web 管理面板即时导出下载，不在磁盘上持久化任何数据。
 """
 
+from ._version import __version__
 from .model import Store, Session
 from .interpreters import Registry
 from .proxy import Listener
 from .server import make_server
 
-__version__ = "0.1.0"
-__all__ = ["Store", "Session", "Registry", "Listener", "make_server"]
+__all__ = ["__version__", "Store", "Session", "Registry", "Listener", "make_server"]

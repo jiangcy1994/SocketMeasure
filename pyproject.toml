@@ -1,6 +1,7 @@
 [project]
 name = "socketmeasure"
-version = "0.1.0"
+# 运行时版本以 socketmeasure/_version.py 为准，此处保持同步
+version = "0.2.0"
 description = "Socket 端口收发测量工具：Web 管理面板 + 可动态扩展的解读器，数据仅存内存、可从面板下载"
 readme = "README.md"
 requires-python = ">=3.10"

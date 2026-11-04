@@ -12,7 +12,9 @@
 """
 
 import base64
+import hashlib
 import json
+import os
 import re
 import socket
 import threading
@@ -20,8 +22,9 @@ import time
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8099"
-TARGET_PORT = 18081
+BASE = os.environ.get("SM_BASE", "http://127.0.0.1:8099")
+TARGET_PORT = int(os.environ.get("SM_TARGET_PORT", 18081))
+ECHO_LISTEN_PORT = int(os.environ.get("SM_ECHO_LISTEN_PORT", 18080))
 ok = True
 TOKEN = None
 
@@ -77,7 +80,7 @@ def row_value(result, label):
 def push_session(data, timeout=5):
     """发送一份数据经转发（回显目标原样返回），等待会话结束后返回新会话 id。"""
     before = {s["id"] for s in json.loads(get("/api/sessions", token=TOKEN))["sessions"]}
-    s = socket.create_connection(("127.0.0.1", 18080), timeout=timeout)
+    s = socket.create_connection(("127.0.0.1", ECHO_LISTEN_PORT), timeout=timeout)
     s.sendall(data)
     s.settimeout(2)
     try:
@@ -120,9 +123,151 @@ def start_echo_target():
     threading.Thread(target=loop, daemon=True).start()
 
 
+WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"   # RFC 6455 §1.3
+WS_PORT = int(os.environ.get("SM_WS_TARGET_PORT", 18084))
+WS_LISTEN_PORT = int(os.environ.get("SM_WS_LISTEN_PORT", 18083))
+
+
+def ws_build_frame(opcode, payload=b"", fin=True, mask=None):
+    """构造一个帧：mask 为 4 字节掩码（客户端）或 None（服务端）。"""
+    b0 = (0x80 if fin else 0) | opcode
+    n = len(payload)
+    if n < 126:
+        head = bytes([b0, (0x80 if mask else 0) | n])
+    elif n < 65536:
+        head = bytes([b0, (0x80 if mask else 0) | 126]) + n.to_bytes(2, "big")
+    else:
+        head = bytes([b0, (0x80 if mask else 0) | 127]) + n.to_bytes(8, "big")
+    if mask:
+        head += mask
+        payload = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+    return head + payload
+
+
+def start_ws_target():
+    """极简 RFC 6455 回显服务：完成握手后，把数据帧原样回发、ping 回 pong。"""
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", WS_PORT))
+    srv.listen(16)
+
+    def handle(c):
+        try:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                d = c.recv(4096)
+                if not d:
+                    return
+                data += d
+            key = re.search(rb"Sec-WebSocket-Key:\s*(\S+)", data).group(1)
+            accept = base64.b64encode(hashlib.sha1(key + WS_GUID).digest()).decode("ascii")
+            c.sendall(("HTTP/1.1 101 Switching Protocols\r\n"
+                       "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                       "Sec-WebSocket-Accept: %s\r\n\r\n" % accept).encode("ascii"))
+            buf = b""
+
+            def exact(n):
+                nonlocal buf
+                while len(buf) < n:
+                    d = c.recv(65536)
+                    if not d:
+                        raise EOFError
+                    buf += d
+                out, buf = buf[:n], buf[n:]
+                return out
+
+            while True:
+                hdr = exact(2)
+                op = hdr[0] & 0x0F
+                masked = hdr[1] & 0x80
+                ln = hdr[1] & 0x7F
+                if ln == 126:
+                    ln = int.from_bytes(exact(2), "big")
+                elif ln == 127:
+                    ln = int.from_bytes(exact(8), "big")
+                m = exact(4) if masked else None
+                payload = exact(ln)
+                if masked:
+                    payload = bytes(b ^ m[i & 3] for i, b in enumerate(payload))
+                if op == 0x8:                       # close -> 回 close 后断开
+                    c.sendall(ws_build_frame(0x8, payload[:2] if len(payload) >= 2 else b""))
+                    break
+                if op == 0x9:                       # ping -> pong
+                    c.sendall(ws_build_frame(0xA, payload))
+                    continue
+                c.sendall(ws_build_frame(0x1, payload))
+        except Exception:
+            pass
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    def loop():
+        while True:
+            c, _ = srv.accept()
+            threading.Thread(target=handle, args=(c,), daemon=True).start()
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def ws_session():
+    """经面板监听端口（WS_LISTEN_PORT）发起一次 WebSocket 会话。
+
+    发送：分片报文「WS-TEST-」+「payload」、单帧报文「Hello」、ping，
+    断开前读取回显。返回（发送的报文负载列表，期望装配结果列表）。
+    """
+    s = socket.create_connection(("127.0.0.1", WS_LISTEN_PORT), timeout=5)
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    s.sendall(("GET /chat HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+               "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n" % key).encode("ascii"))
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        d = s.recv(4096)
+        assert d, "未读到握手响应"
+        buf += d
+    assert buf.split(b"\r\n")[0].endswith(b"101 Switching Protocols"), "握手未通过: %r" % buf[:64]
+    expected = base64.b64encode(
+        hashlib.sha1(key.encode("ascii") + WS_GUID).digest()).decode("ascii")
+    assert expected.encode() in buf, "握手 Accept 不匹配"
+
+    def send(op, payload, fin=True):
+        s.sendall(ws_build_frame(op, payload, fin, mask=os.urandom(4)))
+
+    # 报文 1：分片（帧 1 不带 FIN + 续帧）
+    send(0x1, b"WS-TEST-", fin=False)
+    time.sleep(0.1)
+    send(0x0, b"payload", fin=True)
+    # 报文 2：单帧
+    send(0x1, b"Hello")
+    # ping（控制帧，独立单元）
+    send(0x9, b"ping!")
+
+    s.settimeout(3)
+    got = b""
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d:
+                break
+            got += d
+    except socket.timeout:
+        pass
+    s.close()
+    # 回显目标是「逐帧」回显（服务端合规：不带掩码），因此看到的是分片的两段
+    # 而不是拼接后的整条报文——报文装配由面板侧负责，在 1c 段单独断言。
+    assert b"WS-TEST-" in got and b"payload" in got and b"Hello" in got, \
+        "回显缺失: %r" % got[:80]
+    return None, [b"WS-TEST-payload", b"Hello"]
+
+
 def main():
     global TOKEN
     start_echo_target()
+    start_ws_target()
+
 
     # 0. 鉴权：无令牌应被拒绝；从面板首页提取内置令牌；再创建外部用户令牌
     status, body = request("/api/state")
@@ -149,10 +294,11 @@ def main():
     status, body = request("/api/health", token=TOKEN)
     check("health with valid token", status == 200 and body["ok"] is True
           and body["token_title"] == "e2e")
+    check("api version", body["version"] == "0.2.0")
 
     # 1. 造流量
     payloads = [b"GET /metrics HTTP/1.1\r\nHost: t\r\n\r\n", b'{"type":"sensor","v":1}']
-    s = socket.create_connection(("127.0.0.1", 18080), timeout=5)
+    s = socket.create_connection(("127.0.0.1", ECHO_LISTEN_PORT), timeout=5)
     for p in payloads:
         s.sendall(p)
         time.sleep(0.3)
@@ -241,6 +387,66 @@ def main():
           hexd.get("summary") == "256 字节（页面显示前 1024 字节）" and
           "ff " in hexd.get("text", ""))
 
+    # 1c. WebSocket 会话：通过面板监听端口转发到 WS 回显目标
+    ws_listener = post("/api/listeners", {"name": "ws", "listen_port": WS_LISTEN_PORT,
+                                          "target_host": "127.0.0.1",
+                                          "target_port": WS_PORT}, token=TOKEN)
+    check("create ws listener via api", ws_listener["listener"]["listen_port"] == WS_LISTEN_PORT)
+    _, msg_payloads = ws_session()
+    time.sleep(0.8)
+    state = json.loads(get("/api/sessions", token=TOKEN))
+    ws_sid = state["sessions"][0]["id"]
+    ws_sess = state["sessions"][0]
+    check("ws session protocol detected", ws_sess["protocol"] == "websocket")
+    det = session_detail(ws_sid)
+    interps = interp_results(det)
+    merged_tx = base64.b64decode(det["payload_b64"]["tx"])
+    check("ws handshake visible in tx stream", merged_tx.startswith(b"GET /chat HTTP/1.1\r\n"))
+    check("ws tx stream is masked (not plaintext)",
+          b"Hello" not in merged_tx and b"WS-TEST" not in merged_tx)
+    wsf = interps.get("wsframes", {})
+    check("wsframes interpreter engaged for ws session",
+          wsf.get("summary", "").startswith("WebSocket：") and
+          row_value(wsf, "报文数") is not None)
+    print("   wsframes summary:", wsf.get("summary"))
+    check("wsframes sees handshake",
+          row_value(wsf, "握手首行") == "GET /chat HTTP/1.1")
+    check("wsframes assembles masked fragments",
+          "装配报文" in wsf.get("text", "") and "未见 FIN" not in wsf.get("summary", ""))
+    msgs = json.loads(get("/api/sessions/%s/messages?direction=tx&limit=64" % ws_sid, token=TOKEN))
+    check("ws messages endpoint returns list",
+          msgs.get("protocol") == "websocket" and
+          0 < msgs["messages_total"] <= det["pkts_tx"] * 2 + 1 and
+          msgs["returned"] == len(msgs["messages"]))
+    kinds = [m["kind"] for m in msgs["messages"]]
+    check("ws messages include handshake and data", "handshake" in kinds and "ws-text" in kinds)
+    data_msgs = [m for m in msgs["messages"] if m["kind"] == "ws-text"]
+    check("ws data messages carry unmasked payloads",
+          [base64.b64decode(m["payload_b64"]) for m in data_msgs] == msg_payloads)
+    if data_msgs:
+        print("   ws message kinds:", kinds, "lens:", [m["len"] for m in msgs["messages"]])
+    # 单报文负载：最后一条报文应能单独取到
+    one = json.loads(get("/api/sessions/%s/messages?direction=tx&limit=1&offset=%d"
+                         % (ws_sid, msgs["messages_total"] - 1), token=TOKEN))
+    check("ws single message fetch works",
+          len(one["messages"]) == 1 and one["messages"][0]["seq"] == msgs["messages_total"])
+    one_det = post("/api/sessions/%s/interpret" % ws_sid, token=TOKEN)["session"]
+    check("ws interpret endpoint still works", one_det["id"] == ws_sid and
+          "wsframes" in {r["id"] for r in one_det["interpret"]["tx"]})
+    # 非法参数应被拒绝（接口契约）
+    status, body = request("/api/sessions/%s/messages?direction=xx" % ws_sid, token=TOKEN)
+    check("ws messages rejects bad direction", status == 400 and "error" in body)
+    status, body = request("/api/sessions/%s/messages?direction=tx&limit=0" % ws_sid, token=TOKEN)
+    check("ws messages rejects limit=0", status == 400 and "error" in body)
+    # 不能注册与内置解读器冲突的 id
+    status, body = request("/api/interpreters", method="POST",
+                           obj={"id": "wsframes", "title": "x",
+                                "code": "def interpret(p, m): return {}", "enabled": True},
+                           token=TOKEN)
+    check("builtin interpreter id is reserved", status == 400 and "error" in body)
+    # 删除 ws 监听器
+    request("/api/listeners/" + ws_listener["listener"]["id"], method="DELETE", token=TOKEN)
+
 
     # 2. 注册自定义解读器
     code = (
@@ -294,9 +500,11 @@ def main():
     check("json export has payloads",
           any(base64.b64decode(v["payload_b64"]["tx"]) for v in data["sessions"].values()))
 
-    # 9. 导出 CSV
+    # 9. 导出 CSV（外部工具依赖的 14 列契约不变）
     csv_body = get("/api/export?format=csv", token=TOKEN).decode("utf-8-sig")
-    check("csv export header", csv_body.splitlines()[0].startswith("session_id,listener"))
+    check("csv export header unchanged (14 columns)",
+          csv_body.splitlines()[0] == "session_id,listener,listen_port,client,target,"
+          "state,bytes_tx,bytes_rx,pkts_tx,pkts_rx,started_at,ended_at,duration_s,error")
     print("   csv rows:", len(csv_body.strip().splitlines()) - 1)
 
     # 10. 原始负载下载（用上面 HTTP 报文会话）

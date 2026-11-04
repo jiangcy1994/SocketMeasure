@@ -63,6 +63,7 @@ HTTP/1.1 401 Unauthorized
 | GET | `/api/apicalls?since=N` | 调用日志（`N` 为已收到的最大 seq） | 是 |
 | GET | `/api/sessions` | 会话列表（摘要，新会话在前） | 是 |
 | GET | `/api/sessions/{id}` | 会话详情：base64 负载 + 各解读器结果 | 是 |
+| GET | `/api/sessions/{id}/messages?direction=&limit=&offset=` | 逐报文视图：会话中多个 tx/rx 按协议边界拆开（**新增，原有接口不变**） | 是 |
 | POST | `/api/sessions/{id}/interpret` | 清除解读缓存并重新解读 | 是 |
 | GET | `/api/sessions/{id}/payload?direction=tx&encoding=bin\|hex\|text` | 下载原始负载 | 是 |
 | GET | `/api/listeners` | 监听器列表 | 是 |
@@ -89,10 +90,13 @@ HTTP/1.1 401 Unauthorized
 2. `POST /api/listeners` —— 按测试需要动态开一个转发监听器
    （或在启动面板时用 `--forward` 固定配置）。
 3. 让被测客户端连接该监听端口，收发数据。
-4. `GET /api/state` 或 `GET /api/sessions` —— 轮询/读取计量结果。
+4. `GET /api/state` 或 `GET /api/sessions` —— 轮询/读取计量结果
+   （摘要含 `protocol` 协议识别结果）。
 5. `GET /api/sessions/{id}` —— 拿负载样本与解读结果。
-6. `GET /api/sessions/{id}/payload?...` 或 `/api/export` —— 下载原始数据。
-7. `POST /api/reset` —— 清理基线，开始下一轮测试。
+6. `GET /api/sessions/{id}/messages?direction=tx&limit=&offset=` ——
+   逐报文取负载与解读结果（WebSocket 报文已装配并解除掩码）。
+7. `GET /api/sessions/{id}/payload?...` 或 `/api/export` —— 下载原始数据。
+8. `POST /api/reset` —— 清理基线，开始下一轮测试。
 
 ### curl 示例
 
@@ -113,6 +117,10 @@ curl -s "$BASE/api/sessions?token=$TOKEN"
 
 # 会话详情（含 base64 负载与解读结果）
 curl -s "$BASE/api/sessions/abc123def456" -H "Authorization: Bearer $TOKEN"
+
+# 逐报文视图：会话中该方向的每条报文（WebSocket 报文已装配并解除掩码）
+curl -s "$BASE/api/sessions/abc123def456/messages?direction=tx&limit=64&offset=0" \
+     -H "X-API-Token: $TOKEN"
 
 # 下载 tx 方向原始负载（bin/hex/text）
 curl -sO "$BASE/api/sessions/abc123def456/payload?direction=tx&encoding=bin&token=$TOKEN"
@@ -157,14 +165,19 @@ listener = api("/api/listeners", "POST", {
 state = api("/api/state")
 print(state["totals"])
 
-# 5) 会话详情：用 stats/text/hexdump/json/http 解读器解析负载数据
+# 5) 会话详情：用 stats/text/hexdump/json/http/wsframes 解读器解析负载数据
 for s in api("/api/sessions")["sessions"]:
     det = api("/api/sessions/%s" % s["id"])["session"]
     payload = base64.b64decode(det["payload_b64"]["tx"])
     for r in det["interpret"]["tx"]:
         print(r["id"], r["result"].get("summary"))
 
-# 6) 重置基线
+# 6) 逐报文视图：该方向的每条报文单独取负载与解读结果
+mv = api("/api/sessions/%s/messages?direction=tx&limit=256" % s["id"])
+for m in mv["messages"]:
+    print(m["seq"], m["kind"], m["len"], "bytes")
+
+# 7) 重置基线
 api("/api/reset", "POST", {"sessions": True})
 ```
 
@@ -178,15 +191,20 @@ api("/api/reset", "POST", {"sessions": True})
 {
   "ok": true,
   "service": "socketmeasure",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "token_title": "my-tester",
   "now": 1761900000.0
 }
 ```
 
+`version` 为面板版本号，取自 `socketmeasure/_version.py`（单一来源，
+`/api/state` 与面板页头/页脚显示同一值）。外部工具可用它判断所连面板
+是否满足所需功能（本版含 WebSocket 识别与逐报文解析）。
+
 ### GET /api/state
 
-面板全量状态。`totals` 含会话数、开连接数、双向字节数与包数、当前速率；
+面板全量状态。顶层含 `version`（同 `/api/health`，取自 `_version.py`）、
+`started_at`、`capture_limit`；`totals` 含会话数、开连接数、双向字节数与包数、当前速率；
 `sessions` 为会话摘要数组（新会话在前）；`series` 为最近 120 秒速率序列；
 `interpreters` 为已注册解读器信息。建议轮询间隔 ≥ 1 秒。
 
@@ -212,11 +230,14 @@ api("/api/reset", "POST", {"sessions": True})
 ### GET /api/sessions
 
 会话摘要数组，新会话在前。摘要字段：`id`、`listener_name`、`listen_port`、
-`client`、`target`、`state`（`open`/`closed`/`failed`）、`bytes_tx`、`bytes_rx`、
-`pkts_tx`、`pkts_rx`、`rate_tx_bps`、`rate_rx_bps`、`duration_s`、`captured_*`、
-`truncated`。
+`client`、`target`、`state`（`open`/`closed`/`failed`）、`protocol`
+（`websocket` / `http` / `tls` / `tcp` / `unknown`，按两个方向的流前缀识别）、
+`bytes_tx`、`bytes_rx`、`pkts_tx`、`pkts_rx`、`rate_tx_bps`、`rate_rx_bps`、
+`duration_s`、`captured_*`、`truncated`。
 
 方向约定：`tx` = 客户端 → 目标（上行），`rx` = 目标 → 客户端（下行）。
+`pkts_*` 按 TCP 分段计数（一次 recv 一包）；`messages`（会话详情与
+`/messages` 接口）按应用层报文边界切分，两者含义不同。
 
 ### GET /api/sessions/{id}
 
@@ -230,6 +251,9 @@ api("/api/reset", "POST", {"sessions": True})
     "payload_b64": {"tx": "aGVsbG8...", "rx": ""},
     "payload_version": {"tx": 2, "rx": 0},
     "capture_limit": 1048576,
+    "messages": {"tx": [{"seq": 1, "ts": 1761900000.1, "len": 30, "kind": "recv", "truncated": false}], "rx": [...]},
+    "messages_total": {"tx": 2, "rx": 1},
+    "messages_capped": {"tx": false, "rx": false},
     "interpret": {
       "tx": [
         {"id": "stats", "title": "统计", "result": {"summary": "tx 30 B / rx 36 B（tx 1 包 / rx 1 包）", "rows": [...]}},
@@ -241,11 +265,93 @@ api("/api/reset", "POST", {"sessions": True})
 }
 ```
 
-解读结果按负载版本缓存；修改解读器后想立即重算，调用
+`messages` 为该方向报文分段的轻量列表（不含负载数据，最多前 64 条；
+`messages_total` 为真实条数，超过 64 条时 `messages_capped` 为 true，
+此时用 `GET /api/sessions/{id}/messages` 分页取全部）。每项字段：
+`seq`（从 1 开始）、`ts`（该分段到达时间戳，可能为 null）、`len`、
+`kind`（`recv` = 按 TCP 分段 / `handshake` = HTTP Upgrade 握手 /
+`ws-text` / `ws-binary` / `ws-close` 等 RFC 6455 报文类型）、`truncated`；
+WebSocket 报文另含 `opcode`、`opcode_name`、`fragmented`、`frames`、
+`offset`、`end`。
+
+解读结果按 (负载版本, 协议) 缓存；修改解读器后想立即重算，调用
 `POST /api/sessions/{id}/interpret`。
 
 `interpret` 中的 `result` 形状由解读器决定，可能包含 `summary`（一行摘要）、
 `text`（大段文本）、`rows`（`[{label, value}]` 键值表）、`error`（执行失败标记）。
+
+### GET /api/sessions/{id}/messages
+
+**新增接口（原有接口不受影响）。** 把一个会话中某个方向的多个 tx/rx 按
+协议边界拆成逐条报文，每条报文单独给出 base64 负载与解读结果；
+WebSocket 会话另附帧流概览。
+
+| 参数 | 值 | 说明 |
+| --- | --- | --- |
+| `direction` | `tx`（默认）/ `rx` | 方向；其它值返回 400 |
+| `limit` | 整数，默认 64，最大 256 | 返回条数；`< 1` 返回 400 |
+| `offset` | 整数，默认 0 | 跳过的条数；`< 0` 返回 400；超过总数会自动截断到末尾 |
+
+```json
+{
+  "session_id": "abc123def456",
+  "direction": "tx",
+  "protocol": "websocket",
+  "truncated": false,
+  "capture_limit": 1048576,
+  "messages_total": 3,
+  "returned": 3,
+  "offset": 0,
+  "limit": 64,
+  "interpret_capped": false,
+  "messages": [
+    {
+      "seq": 1, "ts": 1761900000.1, "len": 187, "kind": "handshake",
+      "truncated": false, "payload_b64": "R0VUIC9jaGF0IEhUVFAvMS4x...",
+      "interpret": [ {"id": "wsframes", "title": "WebSocket 解析", "result": {...}} ]
+    },
+    {
+      "seq": 2, "ts": 1761900000.5, "len": 15, "kind": "ws-text",
+      "truncated": false,
+      "opcode": 1, "opcode_name": "text", "fragmented": true, "frames": 2,
+      "offset": 191, "end": 206,
+      "payload_b64": "V1MtVEVTVC1wYXlsb2Fk",
+      "interpret": [ {"id": "stats", "title": "统计", "result": {...}} ]
+    }
+  ],
+  "websocket": {
+    "handshake": {"kind": "request", "start_line": "GET /chat HTTP/1.1",
+                  "headers": [["Host", "127.0.0.1"], ...],
+                  "websocket_upgrade": true, "end_offset": 187, ...},
+    "handshake_len": 187,
+    "tail_bytes": 0,
+    "frames_capped": false,
+    "stray_continuations": 0,
+    "frames": [
+      {"index": 1, "offset": 187, "end": 191, "fin": false, "rsv": 0,
+       "opcode": 1, "opcode_name": "text", "masked": true,
+       "declared_len": 9, "payload_len": 9, "complete": true,
+       "truncated": false, "preview": "WS-TEST-", "notes": []}
+    ]
+  }
+}
+```
+
+字段说明：
+
+- `protocol`：会话协议识别结果（`websocket` / `http` / `tls` / `tcp` / `unknown`）。
+  非 WebSocket 会话每条报文即一次 recv 分段（与 `pkts` 计数一一对应）；
+  WebSocket 会话每条报文是 RFC 6455 §5.4 装配后的完整报文（可跨帧、跨分段）。
+- `payload_b64`：该条报文的原始字节（WebSocket 报文为**已解除掩码、
+  已剥离帧头**的装配结果；`handshake` 报文为 HTTP 头部原文）。
+- `interpret`：该条报文逐条执行全部已启用解读器的结果（解读器 `meta`
+  中额外带 `message` 描述当前报文）。前 32 条参与解读，且全部报文共享
+  8 秒总预算；超限的报文不带 `interpret`，而带 `interpret_skipped: true`，
+  同时顶层 `interpret_capped` 置为 true。
+- `websocket.handshake`：握手头部视图；`websocket.frames` 为逐帧概览，
+  **不含帧负载数据**，只给 48 字节短预览（`preview`）与合规提示（`notes`）。
+- `messages_total` 与分页字段 `returned` / `offset` / `limit` 便于外部工具
+  翻页；例如取第 65 条以后：`?direction=tx&limit=64&offset=64`。
 
 ### GET /api/sessions/{id}/payload
 
@@ -278,6 +384,14 @@ api("/api/reset", "POST", {"sessions": True})
 注册自定义解读器（协议：`def interpret(payload: bytes, meta: dict) -> str | dict`）。
 注册时代码会被编译，必须定义 `interpret` 函数，否则 400。运行时异常被捕获，
 死循环有 5 秒超时保护，不会拖垮面板。
+
+内置解读器 id（注册自定义解读器时不可占用，否则 400）：`stats`（统计）、
+`hexdump`（十六进制转储）、`text`（文本）、`http`（HTTP 请求解析）、
+`json`（JSON 美化）、`wsframes`（WebSocket 帧流解析与 RFC 6455 报文装配）。
+
+`meta` 除原有字段外还含：`protocol`（会话协议识别结果）、`message_count`、
+`messages`（该方向报文分段轻量列表）、`message`（仅 `/messages` 视图：
+当前报文的描述，含 `seq`/`kind`/`opcode_name`/`fragmented`/`frames`）。
 
 ```json
 {"id": "probe", "title": "Probe", "enabled": true,
@@ -336,7 +450,7 @@ api("/api/reset", "POST", {"sessions": True})
 | 状态码 | 含义 |
 | --- | --- |
 | 200 | 成功（导出/下载类通过 `Content-Disposition` 返回文件） |
-| 400 | 参数非法：端口冲突、解读器代码无 `interpret` 函数、删除内置解读器等 |
+| 400 | 参数非法：端口冲突、解读器代码无 `interpret` 函数、删除/占用内置解读器、`/messages` 的 `direction`/`limit`/`offset` 取值非法等 |
 | 401 | 未带令牌 / 令牌无效 / 已停用 / 已删除；或 `user` 令牌调用了令牌管理接口 |
 | 404 | 资源不存在（会话/监听器/解读器/令牌 id 有误） |
 | 405 | 方法不支持（如对 `/api/sessions/{id}` 发 POST 以外的非法操作） |
@@ -356,3 +470,9 @@ api("/api/reset", "POST", {"sessions": True})
 - 自定义解读器以当前进程权限执行，只用于自己编写的调试脚本。
 - 每方向负载样本捕获上限 1 MiB（`--capture-limit` 可调），字节数总计数不受限；
   已关闭会话保留 200 条、事件流 500 条、调用日志 500 条、速率序列 120 秒。
+- `/messages` 单次最多返回 256 条（`limit` 上限），会话详情内嵌的 `messages`
+  最多 64 条（`messages_capped` 为 true 时用 `/messages` 翻页）；
+  `/messages` 中前 32 条报文参与逐报文解读，全部报文共享 8 秒解读预算，
+  超限报文标记 `interpret_skipped`（不会因报文过多而拖垮面板）。
+- WebSocket 解析只识别协议与装配报文，不做 TLS 解密；`protocol` 为 `tls`
+  的会话仅给出字节级识别结论。

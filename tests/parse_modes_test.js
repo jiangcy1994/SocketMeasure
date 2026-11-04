@@ -89,6 +89,71 @@ console.log("未知模式回退hex:", renderPayloadView(bytes("x"), "nope").incl
 try { renderPayloadView(bytes("zz"), "hexstr"); console.log("FAIL 回退逻辑未触发"); }
 catch (e) { console.log("PASS 回退逻辑可捕获:", e.message); }
 
+// ---- WebSocket（ws 模式）----
+function wstest(name, input, dir, requireStr, expectFail) {
+  const data = typeof input === "string" ? bytes(input) : input;
+  try {
+    const html = renderPayloadView(data, "ws", dir);
+    if (expectFail) { console.log("FAIL(应失败但成功) " + name); return; }
+    const missing = (requireStr || []).filter(s => !html.includes(s));
+    console.log(missing.length ? "FAIL " + name + " -> 缺少: " + missing.join(" / ") : "PASS " + name);
+  } catch (e) {
+    console.log(expectFail ? "PASS(预期失败) " + name + " -> " + e.message
+                           : "FAIL(意外) " + name + " -> " + e.message);
+  }
+}
+console.log(typeof wsView === "function" ? "PASS wsView 已定义" : "FAIL wsView 未定义");
+// RFC 6455 §5.7 官方掩码示例：81 85 37 fa 21 3d 7f 9f 4d 51 58 -> "Hello"
+wstest("ws 掩码客户端文本帧(§5.7 向量)", hex("818537fa213d7f9f4d5158"), "tx", ["Hello", "掩码", "1 帧 / 1 报文"]);
+// 服务端无掩码文本帧
+wstest("ws 无掩码服务端文本帧", hex("810548656c6c6f"), "rx", ["Hello", "无掩码"]);
+// tx 未带掩码应给出 §5.3 合规提示
+wstest("ws tx 未掩码触发 §5.3 提示", hex("810548656c6c6f"), "tx", ["必须带掩码"]);
+// 分片报文：01 03 "Hel" + 80 02 "lo"，应装配成 1 条 "Hello"
+wstest("ws 分片装配(§5.4)", hex("010348656c80026c6f"), "rx", ["装配报文", "Hello", "2 帧"]);
+// 握手请求 + 掩码帧：应同时展示握手头部与帧明细
+const hsReq = bytes("GET /chat HTTP/1.1\\r\\nHost: example.com\\r\\nUpgrade: websocket\\r\\n"
+  + "Connection: Upgrade\\r\\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\\r\\n"
+  + "Sec-WebSocket-Version: 13\\r\\n\\r\\n");
+const concat = (a, b) => { const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0); out.set(b, a.length); return out; };
+wstest("ws 握手 + 帧流", concat(hsReq, hex("818537fa213d7f9f4d5158")), "tx",
+  ["Hello", "Sec-WebSocket-Key", "握手", "1 帧 / 1 报文"]);
+// 单报文作用域：负载为装配后已解除掩码的报文（与 /messages 接口返回一致），不再按帧解析
+try {
+  const mv = renderPayloadView(bytes("Hello"), "ws", "tx",
+    { kind: "ws-text", seq: 1, opcode_name: "text" });
+  console.log((mv.includes("单报文作用域") && mv.includes("Hello") && mv.includes("opcode"))
+    ? "PASS ws 单报文作用域" : "FAIL ws 单报文作用域 -> " + mv.slice(0, 120));
+} catch (e) { console.log("FAIL(意外) ws 单报文作用域 -> " + e.message); }
+// 握手报文作用域：负载为 HTTP Upgrade 原文
+try {
+  const hv = renderPayloadView(hsReq, "ws", "tx", { kind: "handshake", seq: 1 });
+  console.log((hv.includes("Sec-WebSocket-Key") && hv.includes("HTTP Upgrade 握手报文原文"))
+    ? "PASS ws 握手报文作用域" : "FAIL ws 握手报文作用域 -> " + hv.slice(0, 120));
+} catch (e) { console.log("FAIL(意外) ws 握手报文作用域 -> " + e.message); }
+// 非 WebSocket 的普通 HTTP 请求应抛错
+wstest("ws 普通 HTTP 不误判", "GET /api/x HTTP/1.1\\r\\nHost: a\\r\\n\\r\\n", "tx", [], true);
+// 任意垃圾字节（无可识别帧）应抛错，不渲染伪帧
+wstest("ws 垃圾字节不误判", "hello world", "tx", [], true);
+// 保留 opcode（0x0f）不作为 WebSocket 证据
+wstest("ws 保留 opcode 不误判", hex("8f00"), "tx", [], true);
+// 流尾被截断的帧应标记而非抛错（前面已有完整帧通过证据门）
+wstest("ws 流尾截断容忍", hex("810548656c6c6f8106"), "rx", ["Hello", "实际仅 0 字节"]);
+// 掩码字段不完整应标记为流尾不完整
+wstest("ws 掩码字段截断容忍", hex("810548656c6c6f818037fa"), "rx", ["掩码字段不完整"]);
+// 16 位扩展长度编码（len7=126，无掩码）
+wstest("ws 16 位扩展长度", hex("817e000548656c6c6f"), "rx", ["Hello"]);
+// 64 位扩展长度编码（len7=127，无掩码）
+wstest("ws 64 位扩展长度", hex("817f000000000000000548656c6c6f"), "rx", ["Hello"]);
+// 关闭帧：88 02 03 e8 = 状态码 1000 无原因
+wstest("ws 关闭帧状态码", hex("880203e8"), "rx", ["1000"]);
+// TLS 字节应给出需先解密的提示
+wstest("ws TLS 记录提示", hex("160301"), "tx", [], true);
+// 空负载提示
+console.log(renderPayloadView(new Uint8Array(0), "ws", "tx").includes("暂无负载数据")
+  ? "PASS ws 空负载提示" : "FAIL ws 空负载提示");
+
 // 主题切换
 function tcase(name, fn) { try { fn(); console.log("PASS " + name); }
   catch (e) { console.log("FAIL " + name + " -> " + e.message); } }
